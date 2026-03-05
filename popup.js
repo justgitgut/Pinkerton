@@ -47,6 +47,29 @@ let myWeight = null;
 /* setInterval handle for the countdown timer displayed when auto-scan is on. */
 let countdownInterval = null;
 
+function decodeMembersMap(rawMembers = {}, memberLocations = []) {
+  const out = {};
+  for (const [username, raw] of Object.entries(rawMembers || {})) {
+    const e = raw && typeof raw === 'object' ? raw : {};
+    const isCompact = ('sc' in e) || ('ls' in e) || ('f' in e) || ('l' in e);
+    if (!isCompact) {
+      out[username] = {
+        isNew: !!e.isNew,
+        isPremium: !!e.isPremium,
+        isVerified: !!e.isVerified,
+      };
+      continue;
+    }
+    const flags = Number(e.f || 0);
+    out[username] = {
+      isNew: !!(flags & 1),
+      isPremium: !!(flags & 2),
+      isVerified: !!(flags & 4),
+    };
+  }
+  return out;
+}
+
 /*
  * Watchdog timer handle.
  *
@@ -125,9 +148,9 @@ const WATCHDOG_MS    = 30000; /* 30 seconds without a progress update = frozen *
 function loadAll() {
   return new Promise(resolve => {
     chrome.storage.local.get(
-      ['pinalove_members', 'pinalove_totals', 'pinalove_settings'],
+      ['pinalove_members', 'pinalove_member_locations', 'pinalove_totals', 'pinalove_settings'],
       data => {
-        members = data.pinalove_members || {};
+        members = decodeMembersMap(data.pinalove_members || {}, data.pinalove_member_locations || []);
         totals  = data.pinalove_totals  || [];
 
         /* Apply saved settings — only override defaults if a value was actually stored. */
@@ -204,14 +227,22 @@ function buildSparkSVG(primary, secondary = [], opts = {}) {
   const interval   = opts.interval   ?? 5;
   const col1       = opts.color1     ?? 'rgba(0,201,167,0.65)';
   const col2       = opts.color2     ?? 'rgba(255,45,155,0.85)';
+  const bgSeries   = opts.bgSeries   ?? [];
+  const bgSecondary = opts.bgSecondary ?? [];
+  const bgColor    = opts.bgColor    ?? 'rgba(140,150,170,0.35)';
+  const bgColor2   = opts.bgColor2   ?? 'rgba(170,170,180,0.42)';
   const labelEvery = opts.labelEvery ?? 3;
   const numBars    = primary.length;
-  const max        = Math.max(...primary, 1); // avoid division by zero
+  const max        = Math.max(...primary, ...secondary, ...bgSeries, ...bgSecondary, 1); // avoid division by zero
   /* Bar width: fill available space evenly, with a 1px gap if bars are wide enough. */
   const barW       = Math.max(1, Math.round(VW / numBars) - (VW / numBars > 2 ? 1 : 0));
 
   /* Build one <g> per time slot containing a primary rect and optional secondary rect. */
   const bars = primary.map((v, i) => {
+    const vb  = bgSeries[i] || 0;
+    const bgH = vb > 0 ? Math.max(1, Math.round((vb / max) * H)) : 0;
+    const vb2 = bgSecondary[i] || 0;
+    const bgH2 = vb2 > 0 ? Math.max(1, Math.round((vb2 / max) * H)) : 0;
     const bH  = Math.max(v > 0 ? 2 : 0, Math.round((v / max) * H)); // min 2px if non-zero
     const v2  = secondary[i] || 0;
     const nH  = v2 > 0 ? Math.max(1, Math.round((v2 / max) * H)) : 0;
@@ -226,6 +257,8 @@ function buildSparkSVG(primary, secondary = [], opts = {}) {
     })();
 
     return `<g>
+      ${bgH ? `<rect x="${x}" y="${H-bgH}" width="${barW}" height="${bgH}" rx="1" fill="${bgColor}"><title>${tip}</title></rect>` : ''}
+      ${bgH2 ? `<rect x="${x}" y="${H-bgH2}" width="${barW}" height="${bgH2}" rx="1" fill="${bgColor2}"><title>${tip}</title></rect>` : ''}
       <rect x="${x}" y="${H-bH}" width="${barW}" height="${bH}" rx="1"
         fill="${col1}" opacity="${v > 0 ? 1 : 0.1}"><title>${tip}</title></rect>
       ${nH ? `<rect x="${x}" y="${H-nH}" width="${barW}" height="${nH}" rx="1" fill="${col2}"><title>${tip}</title></rect>` : ''}
@@ -274,31 +307,52 @@ function renderSparkline() {
     d.setUTCHours(0, 0, 0, 0);
     return d.getTime() - PH_OFFSET_MS;
   })();
+  const prevDayPhMs = todayPhMs - 86400000;
 
+  const prevPrimary = new Array(numBars).fill(0);
+  const prevSecondary = new Array(numBars).fill(0);
   const primary   = new Array(numBars).fill(0);
   const secondary = new Array(numBars).fill(0);
-  let hasData = false;
+  let hasCurrent = false;
+  let hasPrev = false;
 
   /* Place each scan total into its time slot.
      max() prevents shorter overlapping scans from overwriting a larger count. */
   for (const { ts, count, newCount, error } of totals) {
     if (error || count === null) continue; // skip failed scan entries
-    const offsetMs = ts - todayPhMs;
-    if (offsetMs < 0 || offsetMs >= 86400000) continue; // outside today (PH)
-    const slot = Math.floor(offsetMs / (interval * 60000));
-    if (slot < 0 || slot >= numBars) continue;
-    primary[slot]   = Math.max(primary[slot],   count    || 0);
-    secondary[slot] = Math.max(secondary[slot], newCount || 0);
-    hasData = true;
+    const todayOffset = ts - todayPhMs;
+    if (todayOffset >= 0 && todayOffset < 86400000) {
+      const slot = Math.floor(todayOffset / (interval * 60000));
+      if (slot >= 0 && slot < numBars) {
+        primary[slot]   = Math.max(primary[slot],   count    || 0);
+        secondary[slot] = Math.max(secondary[slot], newCount || 0);
+        hasCurrent = true;
+      }
+      continue;
+    }
+
+    const prevOffset = ts - prevDayPhMs;
+    if (prevOffset >= 0 && prevOffset < 86400000) {
+      const slot = Math.floor(prevOffset / (interval * 60000));
+      if (slot >= 0 && slot < numBars) {
+        prevPrimary[slot] = Math.max(prevPrimary[slot], count || 0);
+        prevSecondary[slot] = Math.max(prevSecondary[slot], newCount || 0);
+        hasPrev = true;
+      }
+    }
   }
 
-  if (!hasData) {
+  if (!hasCurrent && !hasPrev) {
     container.innerHTML = '<span style="font-size:10px;color:var(--muted)">No data yet for today</span>';
     return;
   }
 
   container.innerHTML = buildSparkSVG(primary, secondary, {
     vw: 340, h: 56, ah: 18, interval,
+    bgSeries: prevPrimary,
+    bgSecondary: prevSecondary,
+    bgColor: 'rgba(130,140,160,0.42)',
+    bgColor2: 'rgba(150,150,170,0.55)',
     tip: (i, v, v2) => {
       const phMin = i * interval;
       const hh = String(Math.floor(phMin / 60)).padStart(2, '0');
@@ -792,9 +846,11 @@ function bindEvents() {
     }
 
     /* Members database updated — re-render New/Premium/Verified totals. */
-    if (changes.pinalove_members) {
-      members = changes.pinalove_members.newValue || {};
-      renderStats();
+    if (changes.pinalove_members || changes.pinalove_member_locations) {
+      chrome.storage.local.get(['pinalove_members', 'pinalove_member_locations'], data => {
+        members = decodeMembersMap(data.pinalove_members || {}, data.pinalove_member_locations || []);
+        renderStats();
+      });
     }
 
     /* Settings change — re-render sparkline if interval changed. */

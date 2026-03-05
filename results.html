@@ -255,6 +255,19 @@
       background: var(--surf); color: var(--muted); cursor: pointer; font-size: 13px; transition: all .12s;
     }
     .vbtn.active { background: rgba(0,229,255,.12); border-color: var(--cyan); color: var(--cyan); }
+      .history-debug-badge {
+        display: none;
+        align-items: center;
+        padding: 6px 10px;
+        border: 1px solid rgba(255, 45, 155, 0.35);
+        border-radius: 999px;
+        color: #ff8dc8;
+        background: rgba(255, 45, 155, 0.08);
+        font-family: "DM Mono", monospace;
+        font-size: 10px;
+        letter-spacing: 0.02em;
+        white-space: nowrap;
+      }
     .vbtn:hover:not(.active) { color: var(--text); border-color: var(--muted2); }
 
     /* ── Lazy sentinel ── */
@@ -557,6 +570,7 @@
       <button class="vbtn active" id="gridViewBtn">⊞</button>
       <button class="vbtn" id="tableViewBtn">☰</button>
     </div>
+      <span id="historyDebugBadge" class="history-debug-badge"></span>
     <button class="btn btn-ghost" id="refreshBtn">↻</button>
   </div>
 

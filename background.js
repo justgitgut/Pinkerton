@@ -16,7 +16,7 @@
 /* ─── Constants ─────────────────────────────────────────────────────────────── */
 
 const ALARM_NAME = 'pinalove_auto_scan';
-const STORAGE_SCHEMA_VERSION = 2;
+const STORAGE_SCHEMA_VERSION = 6;
 
 /* In-memory scan interval — overwritten from storage on every setupAlarm() call.
    Kept in memory so getAlarmStatus can return it without an extra storage read. */
@@ -28,6 +28,21 @@ let _stopRequested = false;
 
 /* How many days of per-user hourly history to retain before pruning. */
 const HISTORY_DAYS = 30;
+const HISTORY_SLOT_MINUTES = 15;
+const HISTORY_SLOTS_PER_DAY = 96;
+const HISTORY_PACK_PREFIX = 'p1:';
+const MEMBER_FLAG_NEW = 1;
+const MEMBER_FLAG_PREMIUM = 2;
+const MEMBER_FLAG_VERIFIED = 4;
+
+/* Scan diff bitmask for compact changelog entries [ts, mask]. */
+const MEMBER_DIFF_PREMIUM = 1;
+const MEMBER_DIFF_NEW = 2;
+const MEMBER_DIFF_VERIFIED = 4;
+const MEMBER_DIFF_AGE = 8;
+const MEMBER_DIFF_LOCATION = 16;
+const MEMBER_DIFF_PHOTO = 32;
+const MEMBER_LOG_MAX = 10;
 
 /* Base URL for all PinaLove requests. */
 const BASE = 'https://www.pinalove.com';
@@ -96,6 +111,108 @@ function canonicalPhotoId(uri) {
   return path.replace(/\/+$/, '');
 }
 
+function memberFlags(isNew, isPremium, isVerified) {
+  let f = 0;
+  if (isNew) f |= MEMBER_FLAG_NEW;
+  if (isPremium) f |= MEMBER_FLAG_PREMIUM;
+  if (isVerified) f |= MEMBER_FLAG_VERIFIED;
+  return f;
+}
+
+function ensureLocationIndex(location, locations, locationToIndex) {
+  const loc = (location || '').trim();
+  if (!loc) return null;
+  if (locationToIndex.has(loc)) return locationToIndex.get(loc);
+  const idx = locations.length;
+  locations.push(loc);
+  locationToIndex.set(loc, idx);
+  return idx;
+}
+
+function normalizeMemberLog(rawLog = null) {
+  if (Array.isArray(rawLog) && rawLog.every(v => Array.isArray(v) && v.length >= 2)) {
+    return rawLog
+      .map(v => [Number(v[0]) || 0, Number(v[1]) || 0])
+      .filter(v => v[0] > 0 && v[1] > 0)
+      .slice(-MEMBER_LOG_MAX);
+  }
+
+  if (Array.isArray(rawLog)) {
+    const out = [];
+    for (const item of rawLog) {
+      const changes = item?.changes || {};
+      let mask = 0;
+      if (changes.isPremium)  mask |= MEMBER_DIFF_PREMIUM;
+      if (changes.isNew)      mask |= MEMBER_DIFF_NEW;
+      if (changes.isVerified) mask |= MEMBER_DIFF_VERIFIED;
+      if (changes.age)        mask |= MEMBER_DIFF_AGE;
+      if (changes.location)   mask |= MEMBER_DIFF_LOCATION;
+      if (changes.photoUrl)   mask |= MEMBER_DIFF_PHOTO;
+      const ts = Number(item?.ts) || 0;
+      if (ts > 0 && mask > 0) out.push([ts, mask]);
+    }
+    return out.slice(-MEMBER_LOG_MAX);
+  }
+
+  return [];
+}
+
+function compactMemberEntry(raw, username, locations, locationToIndex) {
+  const src = raw && typeof raw === 'object' ? raw : {};
+  const isCompact = ('sc' in src) || ('ls' in src) || ('f' in src) || ('l' in src);
+
+  if (isCompact) {
+    const locIdx = (typeof src.l === 'number')
+      ? src.l
+      : ensureLocationIndex(src.location || '', locations, locationToIndex);
+    return {
+      a: src.a ?? src.age ?? null,
+      l: (typeof locIdx === 'number') ? locIdx : null,
+      p: src.p || canonicalPhotoId(src.photoUrl) || '',
+      f: Number.isInteger(src.f) ? src.f : memberFlags(src.isNew, src.isPremium, src.isVerified),
+      j: src.j ?? src.joinMonth ?? null,
+      ls: src.ls ?? src.lastSeen ?? src.sc ?? src.lastScanned ?? 0,
+      fs: src.fs ?? src.firstSeen ?? src.sc ?? src.lastScanned ?? 0,
+      sc: src.sc ?? src.lastScanned ?? 0,
+      g: normalizeMemberLog(src.g ?? src.changelog),
+    };
+  }
+
+  return {
+    a: src.age ?? null,
+    l: ensureLocationIndex(src.location || '', locations, locationToIndex),
+    p: canonicalPhotoId(src.photoUrl) || '',
+    f: memberFlags(!!src.isNew, !!src.isPremium, !!src.isVerified),
+    j: src.joinMonth ?? null,
+    ls: src.lastSeen ?? src.lastScanned ?? 0,
+    fs: src.firstSeen ?? src.lastScanned ?? 0,
+    sc: src.lastScanned ?? 0,
+    g: normalizeMemberLog(src.changelog),
+  };
+}
+
+function compactLocationDictionary(members, locations) {
+  const used = new Set();
+  for (const m of Object.values(members)) {
+    if (typeof m?.l === 'number' && m.l >= 0 && m.l < locations.length) used.add(m.l);
+  }
+
+  const remap = new Map();
+  const compactLocs = [];
+  for (let i = 0; i < locations.length; i++) {
+    if (!used.has(i)) continue;
+    remap.set(i, compactLocs.length);
+    compactLocs.push(locations[i]);
+  }
+
+  for (const m of Object.values(members)) {
+    if (typeof m?.l !== 'number') { m.l = null; continue; }
+    m.l = remap.has(m.l) ? remap.get(m.l) : null;
+  }
+
+  return compactLocs;
+}
+
 function migrateProfileEntry(raw) {
   const old = raw || {};
   const snapshots = Array.isArray(old.snapshots) ? old.snapshots : [];
@@ -123,19 +240,19 @@ function migrateProfileEntry(raw) {
 
 async function runStorageMigrationIfNeeded() {
   return new Promise(resolve => {
-    const keys = ['pinalove_schema_version', 'pinalove_members', 'pinalove_profiles'];
+    const keys = ['pinalove_schema_version', 'pinalove_members', 'pinalove_member_locations', 'pinalove_profiles', 'pinalove_history'];
     chrome.storage.local.get(keys, data => {
       const current = data.pinalove_schema_version || 0;
       if (current >= STORAGE_SCHEMA_VERSION) return resolve();
 
-      const members = data.pinalove_members || {};
-      for (const m of Object.values(members)) {
-        delete m.title;
-        delete m.bio;
-        delete m.fields;
-        delete m.photos;
-        delete m.photoStats;
+      const oldMembers = data.pinalove_members || {};
+      const locations = Array.isArray(data.pinalove_member_locations) ? [...data.pinalove_member_locations] : [];
+      const locationToIndex = new Map(locations.map((v, i) => [v, i]));
+      const members = {};
+      for (const [username, raw] of Object.entries(oldMembers)) {
+        members[username] = compactMemberEntry(raw, username, locations, locationToIndex);
       }
+      const compactLocations = compactLocationDictionary(members, locations);
 
       const oldProfiles = data.pinalove_profiles || {};
       const newProfiles = {};
@@ -143,9 +260,23 @@ async function runStorageMigrationIfNeeded() {
         newProfiles[username] = migrateProfileEntry(raw);
       }
 
+      const oldHistory = data.pinalove_history || {};
+      const newHistory = {};
+      for (const [username, userDays] of Object.entries(oldHistory)) {
+        if (!userDays || typeof userDays !== 'object') continue;
+        const migratedDays = {};
+        for (const [day, dayBuckets] of Object.entries(userDays)) {
+          const slots = toQuarterSlots96(dayBuckets);
+          if (slots.some(v => v > 0)) migratedDays[day] = encodeQuarterSlots(slots);
+        }
+        if (Object.keys(migratedDays).length) newHistory[username] = migratedDays;
+      }
+
       chrome.storage.local.set({
         pinalove_members: members,
+        pinalove_member_locations: compactLocations,
         pinalove_profiles: newProfiles,
+        pinalove_history: newHistory,
         pinalove_schema_version: STORAGE_SCHEMA_VERSION,
       }, () => {
         chrome.storage.local.remove('pinalove_records', () => {
@@ -356,27 +487,151 @@ function tsToPhDay(ts) {
  */
 function tsToPhHour(ts) { return new Date(ts + PH_OFFSET_MS).getUTCHours(); }
 
+/**
+ * Return the 15-minute slot index (0-95) of a timestamp in Philippine time.
+ * slot 0 = 00:00-00:14, slot 95 = 23:45-23:59.
+ *
+ * @param {number} ts
+ * @returns {number}
+ */
+function tsToPhQuarterSlot(ts) {
+  const d = new Date(ts + PH_OFFSET_MS);
+  return (d.getUTCHours() * 4) + Math.floor(d.getUTCMinutes() / 15);
+}
+
 /* ─── History tracking ───────────────────────────────────────────────────────── */
 
 /*
  * History storage format (pinalove_history):
  *   {
  *     [username]: {
- *       "YYYY-MM-DD": [m0, m1, ..., m23],  // minutes online per PH hour slot
+ *       "YYYY-MM-DD": "p1:<base64>", // packed 96-slot (15-min) minute buckets
  *       ...
  *     },
  *     ...
  *   }
  *
  * Each scan credits SCAN_INTERVAL_MINUTES to the bucket for the current
- * PH day and hour, capped at 60 minutes per slot to prevent over-counting.
+ * PH day and 15-minute slot, capped at 15 minutes per slot to prevent over-counting.
  * Day buckets older than HISTORY_DAYS are pruned after every write.
  */
 
+function addLegacyHourToQuarterSlots(slots, hour, minsRaw) {
+  const mins = Math.max(0, Math.min(60, Math.round(Number(minsRaw) || 0)));
+  if (mins <= 0 || hour < 0 || hour > 23) return;
+
+  const base = Math.floor(mins / 4);
+  let rem = mins % 4;
+  for (let q = 0; q < 4; q++) {
+    const slot = (hour * 4) + q;
+    const add = base + (rem > 0 ? 1 : 0);
+    if (rem > 0) rem--;
+    if (add <= 0) continue;
+    slots[slot] = Math.min(HISTORY_SLOT_MINUTES, (slots[slot] || 0) + add);
+  }
+}
+
+function decodePackedQuarterSlots(dayBuckets) {
+  if (typeof dayBuckets !== 'string' || !dayBuckets.startsWith(HISTORY_PACK_PREFIX)) return null;
+  try {
+    const b64 = dayBuckets.slice(HISTORY_PACK_PREFIX.length);
+    const raw = atob(b64);
+    const bytes = new Uint8Array(raw.length);
+    for (let i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i) & 255;
+
+    const out = new Array(HISTORY_SLOTS_PER_DAY).fill(0);
+    for (let i = 0; i < HISTORY_SLOTS_PER_DAY; i++) {
+      const byte = bytes[Math.floor(i / 2)] || 0;
+      const nibble = (i % 2 === 0) ? (byte >> 4) : (byte & 0x0f);
+      out[i] = Math.min(HISTORY_SLOT_MINUTES, nibble);
+    }
+    return out;
+  } catch {
+    return null;
+  }
+}
+
+function encodeQuarterSlots(slots) {
+  const bytes = new Uint8Array(HISTORY_SLOTS_PER_DAY / 2);
+  for (let i = 0; i < HISTORY_SLOTS_PER_DAY; i += 2) {
+    const hi = Math.max(0, Math.min(HISTORY_SLOT_MINUTES, Math.round(Number(slots[i] || 0))));
+    const lo = Math.max(0, Math.min(HISTORY_SLOT_MINUTES, Math.round(Number(slots[i + 1] || 0))));
+    bytes[Math.floor(i / 2)] = (hi << 4) | lo;
+  }
+  let raw = '';
+  for (let i = 0; i < bytes.length; i++) raw += String.fromCharCode(bytes[i]);
+  return HISTORY_PACK_PREFIX + btoa(raw);
+}
+
 /**
- * Update per-user hourly activity history for a completed scan.
+ * Normalize any supported day bucket shape into a 96-slot (15-minute) array.
  *
- * Credits each online user with scanInterval minutes in today's PH hour bucket,
+ * @param {any} dayBuckets
+ * @returns {number[]}
+ */
+function toQuarterSlots96(dayBuckets) {
+  const packed = decodePackedQuarterSlots(dayBuckets);
+  if (packed) return packed;
+
+  const out = new Array(HISTORY_SLOTS_PER_DAY).fill(0);
+
+  if (Array.isArray(dayBuckets)) {
+    if (dayBuckets.length >= HISTORY_SLOTS_PER_DAY) {
+      for (let slot = 0; slot < Math.min(dayBuckets.length, HISTORY_SLOTS_PER_DAY); slot++) {
+        const mins = Math.round(Number(dayBuckets[slot] || 0));
+        if (mins > 0) out[slot] = Math.min(HISTORY_SLOT_MINUTES, mins);
+      }
+    } else {
+      for (let h = 0; h < Math.min(dayBuckets.length, 24); h++) {
+        addLegacyHourToQuarterSlots(out, h, dayBuckets[h]);
+      }
+    }
+    return out;
+  }
+
+  if (!dayBuckets || typeof dayBuckets !== 'object') return out;
+
+  for (const [k, v] of Object.entries(dayBuckets)) {
+    const mins = Math.round(Number(v || 0));
+    if (mins <= 0) continue;
+
+    if (/^q\d+$/.test(k)) {
+      const slot = Number(k.slice(1));
+      if (!Number.isInteger(slot) || slot < 0 || slot >= HISTORY_SLOTS_PER_DAY) continue;
+      out[slot] = Math.min(HISTORY_SLOT_MINUTES, mins);
+      continue;
+    }
+
+    const h = Number(k);
+    if (Number.isInteger(h) && h >= 0 && h <= 23) {
+      addLegacyHourToQuarterSlots(out, h, mins);
+    }
+  }
+
+  return out;
+}
+
+/**
+ * Sum total minutes in a day bucket, supporting both array and sparse forms.
+ *
+ * @param {any} dayBuckets
+ * @returns {number}
+ */
+function sumDayBucketMinutes(dayBuckets) {
+  const packed = decodePackedQuarterSlots(dayBuckets);
+  if (packed) return packed.reduce((sum, v) => sum + (Number(v) || 0), 0);
+
+  if (Array.isArray(dayBuckets)) {
+    return dayBuckets.reduce((sum, v) => sum + (Number(v) || 0), 0);
+  }
+  if (!dayBuckets || typeof dayBuckets !== 'object') return 0;
+  return Object.values(dayBuckets).reduce((sum, v) => sum + (Number(v) || 0), 0);
+}
+
+/**
+ * Update per-user 15-minute activity history for a completed scan.
+ *
+ * Credits each online user with scanInterval minutes in today's PH quarter-slot bucket,
  * prunes stale day buckets, then triggers a storage pressure check.
  *
  * @param {number}   scanTs          - Timestamp when the scan started.
@@ -389,15 +644,16 @@ async function updateHistory(scanTs, onlineUsernames) {
       const history = data.pinalove_history || {};
       const cutoff  = tsToPhDay(scanTs - HISTORY_DAYS * 86400000); // oldest day to keep
       const day     = tsToPhDay(scanTs);
-      const hour    = tsToPhHour(scanTs);
+      const slot    = tsToPhQuarterSlot(scanTs);
       const mins    = Math.round(SCAN_INTERVAL_MINUTES);
 
-      /* Increment the hour bucket for each online user. */
+      /* Increment the 15-minute slot bucket for each online user. */
       for (const username of onlineUsernames) {
         if (!history[username])      history[username] = {};
-        if (!history[username][day]) history[username][day] = new Array(24).fill(0);
-        /* Cap at 60 so a slot never exceeds one hour of credited time. */
-        history[username][day][hour] = Math.min(60, (history[username][day][hour] || 0) + mins);
+        const slots = toQuarterSlots96(history[username][day]);
+        /* Cap at 15 so a slot never exceeds one 15-minute segment. */
+        slots[slot] = Math.min(HISTORY_SLOT_MINUTES, (slots[slot] || 0) + mins);
+        history[username][day] = encodeQuarterSlots(slots);
       }
 
       /* Prune day buckets older than the cutoff date. */
@@ -455,7 +711,7 @@ async function runStoragePurgeIfNeeded() {
            Higher score = more activity = keep longer. */
         const scores = Object.entries(history).map(([username, entry]) => {
           const total = Object.entries(entry)
-            .reduce((sum, [, buckets]) => sum + (buckets || []).reduce((s, m) => s + (m || 0), 0), 0);
+            .reduce((sum, [, buckets]) => sum + sumDayBucketMinutes(buckets), 0);
           return { username, total };
         });
 
@@ -993,27 +1249,6 @@ async function storeFailedScan(ts, reason) {
  */
 
 /**
- * Compute a diff object between two flat value maps.
- * Returns only keys where the values differ (ignoring undefined/null transitions
- * for fields that simply weren't present before).
- *
- * @param {object} oldObj - Previous field values.
- * @param {object} newObj - New field values.
- * @param {string[]} keys - Which keys to compare.
- * @returns {object} { field: [oldVal, newVal], ... } — empty if nothing changed.
- */
-function diffFields(oldObj, newObj, keys) {
-  const changes = {};
-  for (const k of keys) {
-    const o = oldObj[k] ?? null;
-    const n = newObj[k] ?? null;
-    /* Treat null/undefined as equivalent — only record meaningful value changes. */
-    if (o !== n && !(o == null && n == null)) changes[k] = [o, n];
-  }
-  return changes;
-}
-
-/**
  * Merge a completed scan's user list into pinalove_members.
  *
  * For each user:
@@ -1028,61 +1263,68 @@ function diffFields(oldObj, newObj, keys) {
  * @returns {Promise<void>}
  */
 async function mergeMembersFromScan(scanTs, users) {
-  /* Fields we track for diffs from the browse scan. */
-  const SCAN_DIFF_FIELDS = ['isPremium', 'isNew', 'isVerified', 'age', 'location', 'photoUrl'];
-
   return new Promise(resolve => {
-    chrome.storage.local.get('pinalove_members', data => {
+    chrome.storage.local.get(['pinalove_members', 'pinalove_member_locations'], data => {
       const members = data.pinalove_members || {};
+      let locations = Array.isArray(data.pinalove_member_locations) ? [...data.pinalove_member_locations] : [];
+      const locationToIndex = new Map(locations.map((v, i) => [v, i]));
       const cutoff  = Date.now() - 30 * 86400000; // 30-day retention window
+
+      /* Normalize any legacy member entries to compact form before merging. */
+      for (const [username, raw] of Object.entries(members)) {
+        members[username] = compactMemberEntry(raw, username, locations, locationToIndex);
+      }
 
       for (const u of users) {
         if (!u.username) continue;
 
         const existing = members[u.username];
+        const locIdx = ensureLocationIndex(u.location || '', locations, locationToIndex);
+        const newFlags = memberFlags(!!u.isNew, !!u.isPremium, !!u.isVerified);
+        const newPhoto = canonicalPhotoId(u.photoUrl) || '';
+        const newAge = (u.age == null ? null : u.age);
+        const newLastSeen = u.lastSeen ?? scanTs;
+        const newJoinMonth = u.joinMonth || null;
 
         if (!existing) {
-          /* New user — insert fresh record with no changelog yet. */
+          /* New user — insert compact record. */
           members[u.username] = {
-            username:    u.username,
-            profileUrl:  u.profileUrl  || '',
-            photoUrl:    u.photoUrl    || '',
-            age:         u.age         ?? null,
-            location:    u.location    || '',
-            isPremium:   u.isPremium   || false,
-            isNew:       u.isNew       || false,
-            isVerified:  u.isVerified  || false,
-            joinMonth:   u.joinMonth   || null,
-            lastSeen:    u.lastSeen    ?? scanTs,
-            firstSeen:   scanTs,
-            lastScanned: scanTs,
-            changelog:   [],
+            a: newAge,
+            l: (typeof locIdx === 'number') ? locIdx : null,
+            p: newPhoto,
+            f: newFlags,
+            j: newJoinMonth,
+            ls: newLastSeen,
+            fs: scanTs,
+            sc: scanTs,
+            g: [],
           };
         } else {
-          /* Existing user — diff scan fields and record any changes. */
-          const changes = diffFields(existing, u, SCAN_DIFF_FIELDS);
-          if (Object.keys(changes).length > 0) {
-            existing.changelog.push({ ts: scanTs, source: 'scan', changes });
+          /* Existing user — append compact diff mask when scan fields changed. */
+          let mask = 0;
+          const prevFlags = Number(existing.f || 0);
+          if ((prevFlags & MEMBER_FLAG_PREMIUM) !== (newFlags & MEMBER_FLAG_PREMIUM)) mask |= MEMBER_DIFF_PREMIUM;
+          if ((prevFlags & MEMBER_FLAG_NEW) !== (newFlags & MEMBER_FLAG_NEW)) mask |= MEMBER_DIFF_NEW;
+          if ((prevFlags & MEMBER_FLAG_VERIFIED) !== (newFlags & MEMBER_FLAG_VERIFIED)) mask |= MEMBER_DIFF_VERIFIED;
+          if ((existing.a ?? null) !== newAge) mask |= MEMBER_DIFF_AGE;
+          if ((existing.l ?? null) !== ((typeof locIdx === 'number') ? locIdx : null)) mask |= MEMBER_DIFF_LOCATION;
+          if ((existing.p || '') !== newPhoto) mask |= MEMBER_DIFF_PHOTO;
+          if (mask > 0) {
+            existing.g = normalizeMemberLog(existing.g);
+            existing.g.push([scanTs, mask]);
+            if (existing.g.length > MEMBER_LOG_MAX) {
+              existing.g = existing.g.slice(existing.g.length - MEMBER_LOG_MAX);
+            }
           }
 
-          /* Always update mutable scan fields. */
-          existing.isPremium   = u.isPremium   || false;
-          existing.isNew       = u.isNew       || false;
-          existing.isVerified  = u.isVerified  || false;
-          existing.lastScanned = scanTs;
-          if (u.lastSeen)    existing.lastSeen    = u.lastSeen;
-          if (u.age)         existing.age         = u.age;
-          if (u.location)    existing.location    = u.location;
-          if (u.photoUrl)    existing.photoUrl    = u.photoUrl;
-          if (u.joinMonth)   existing.joinMonth   = u.joinMonth;
-          if (u.profileUrl)  existing.profileUrl  = u.profileUrl;
-
-          /* Remove legacy duplicated profile payload from members. */
-          delete existing.title;
-          delete existing.bio;
-          delete existing.fields;
-          delete existing.photos;
-          delete existing.photoStats;
+          existing.f = newFlags;
+          existing.sc = scanTs;
+          existing.ls = newLastSeen;
+          existing.a = newAge;
+          existing.p = newPhoto;
+          existing.l = (typeof locIdx === 'number') ? locIdx : null;
+          if (newJoinMonth && (!existing.j || newJoinMonth < existing.j)) existing.j = newJoinMonth;
+          if (!existing.fs) existing.fs = scanTs;
         }
       }
 
@@ -1091,16 +1333,12 @@ async function mergeMembersFromScan(scanTs, users) {
          so a user who reappears briefly doesn't keep a long-inactive entry alive. */
       for (const username of Object.keys(members)) {
         const m = members[username];
-        delete m.title;
-        delete m.bio;
-        delete m.fields;
-        delete m.photos;
-        delete m.photoStats;
-        const age = m.lastSeen ?? m.lastScanned ?? 0;
+        const age = m.ls ?? m.lastSeen ?? m.sc ?? m.lastScanned ?? 0;
         if (age < cutoff) delete members[username];
       }
 
-      chrome.storage.local.set({ pinalove_members: members }, resolve);
+      locations = compactLocationDictionary(members, locations);
+      chrome.storage.local.set({ pinalove_members: members, pinalove_member_locations: locations }, resolve);
     });
   });
 }
@@ -1154,22 +1392,20 @@ async function mergeMembersFromProfile(username, profileData) {
   if (!username) return;
 
   return new Promise(resolve => {
-    chrome.storage.local.get('pinalove_members', data => {
+    chrome.storage.local.get(['pinalove_members', 'pinalove_member_locations'], data => {
       const members = data.pinalove_members || {};
+      const locations = Array.isArray(data.pinalove_member_locations) ? [...data.pinalove_member_locations] : [];
+      const locationToIndex = new Map(locations.map((v, i) => [v, i]));
       const m = members[username];
       if (!m) return resolve();
 
-      if (profileData.joinMonth && (!m.joinMonth || profileData.joinMonth < m.joinMonth)) {
-        m.joinMonth = profileData.joinMonth;
+      const compact = compactMemberEntry(m, username, locations, locationToIndex);
+
+      if (profileData.joinMonth && (!compact.j || profileData.joinMonth < compact.j)) {
+        compact.j = profileData.joinMonth;
       }
 
-      /* Ensure legacy duplicated profile payload is removed. */
-      delete m.title;
-      delete m.bio;
-      delete m.fields;
-      delete m.photos;
-      delete m.photoStats;
-
+      members[username] = compact;
       chrome.storage.local.set({ pinalove_members: members }, resolve);
     });
   });
@@ -1328,6 +1564,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   if (request.action === 'clearRecords') {
     chrome.storage.local.set({
       pinalove_members:  {},
+      pinalove_member_locations: [],
       pinalove_history:  {},
       pinalove_totals:   [],
       pinalove_profiles: {},

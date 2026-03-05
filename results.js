@@ -11,6 +11,8 @@ const $ = id => document.getElementById(id);
 
 /* Philippine timezone offset: UTC+8 hours (used throughout for all time calculations) */
 const PH_OFFSET_MS = 8 * 3600 * 1000;
+const HISTORY_PACK_PREFIX = 'p1:';
+const MEMBER_BASE_URL = 'https://www.pinalove.com';
 
 /* 
   =====================================================
@@ -26,8 +28,8 @@ let filteredUsers = [];
 
 /* 
   Per-user activity history keyed by username
-  Format: { username: { "YYYY-MM-DD": [m0..m23] } }
-  Each m0-m23 is total minutes active in that hour (PH time)
+  Format: { username: { "YYYY-MM-DD": {"q0":m0,...} } } (legacy hourly formats also supported)
+  Quarter-slot data is aggregated to hourly when rendering existing charts.
 */
 let history       = {};
 
@@ -57,6 +59,9 @@ let myWeight      = null;
   Used to determine which users were "online now" (comparing to user.lastScanned)
 */
 let latestScanTs  = 0;
+
+/* Enable migration counters via ?debug=1 or ?debugHistory=1 (or #debug). */
+const DEBUG_HISTORY = /(?:[?&]debug=1\b|[?&]debugHistory=1\b)/i.test(location.search) || /debug(?:history)?/i.test(location.hash);
 
 /* Compact storage schema for profile fields in pinalove_profiles. */
 const FIELD_KEY_MAP = {
@@ -122,6 +127,44 @@ function decodeProfilesMap(rawAll) {
   const out = {};
   for (const [username, raw] of Object.entries(rawAll || {})) out[username] = decodeProfileEntry(raw);
   return out;
+}
+
+function decodeMemberEntry(username, raw, locations = []) {
+  const entry = raw && typeof raw === 'object' ? raw : {};
+  const isCompact = ('sc' in entry) || ('ls' in entry) || ('f' in entry) || ('l' in entry);
+  if (!isCompact) {
+    return {
+      username,
+      age: entry.age ?? null,
+      location: entry.location || '',
+      photoUrl: entry.photoUrl || '',
+      isNew: !!entry.isNew,
+      isPremium: !!entry.isPremium,
+      isVerified: !!entry.isVerified,
+      joinMonth: entry.joinMonth ?? null,
+      lastSeen: entry.lastSeen ?? 0,
+      firstSeen: entry.firstSeen ?? 0,
+      lastScanned: entry.lastScanned ?? 0,
+      profileUrl: `${MEMBER_BASE_URL}/${username}`,
+    };
+  }
+
+  const flags = Number(entry.f || 0);
+  const locIdx = Number.isInteger(entry.l) ? entry.l : null;
+  return {
+    username,
+    age: entry.a ?? null,
+    location: (locIdx != null && locIdx >= 0 && locIdx < locations.length) ? (locations[locIdx] || '') : '',
+    photoUrl: entry.p || '',
+    isNew: !!(flags & 1),
+    isPremium: !!(flags & 2),
+    isVerified: !!(flags & 4),
+    joinMonth: entry.j ?? null,
+    lastSeen: entry.ls ?? 0,
+    firstSeen: entry.fs ?? 0,
+    lastScanned: entry.sc ?? 0,
+    profileUrl: `${MEMBER_BASE_URL}/${username}`,
+  };
 }
 
 /* Lazy loading: current batch index for grid/table rendering */
@@ -193,7 +236,7 @@ document.addEventListener('DOMContentLoaded', () => { bindEvents(); loadData(); 
   then renders the main view with applied filters.
 */
 function loadData() {
-  chrome.storage.local.get(['pinalove_members','pinalove_filters','pinalove_history','pinalove_profiles','pinalove_totals','pinalove_settings','pinalove_visited'], data => {
+  chrome.storage.local.get(['pinalove_members','pinalove_member_locations','pinalove_filters','pinalove_history','pinalove_profiles','pinalove_totals','pinalove_settings','pinalove_visited'], data => {
     /* Restore active filters from storage (age range, sort, type filters) */
     if (data.pinalove_filters) {
       const f = data.pinalove_filters;
@@ -203,12 +246,13 @@ function loadData() {
       if (f.typeFilters) Object.assign(typeFilters, f.typeFilters);
     }
     history  = data.pinalove_history  || {};
+    renderHistoryDebugBadge();
     if (data.pinalove_settings?.scanInterval) scanInterval = data.pinalove_settings.scanInterval;
     if (data.pinalove_settings?.myHeight)     myHeight     = data.pinalove_settings.myHeight;
     if (data.pinalove_settings?.myWeight)     myWeight     = data.pinalove_settings.myWeight;
     profiles = decodeProfilesMap(data.pinalove_profiles || {});
     totals   = data.pinalove_totals   || [];
-    buildAllUsers(data.pinalove_members || {}, data.pinalove_visited || {});
+    buildAllUsers(data.pinalove_members || {}, data.pinalove_member_locations || [], data.pinalove_visited || {});
     populateLocations();
     syncFilterUI();
     applyAndRender();
@@ -217,6 +261,50 @@ function loadData() {
     const hasData = Object.keys(data.pinalove_members || {}).length > 0;
     if (!hasData) { const b = $('debugBar'); if (b) b.style.display='block'; }
   });
+}
+
+/* Build compact counts to verify sparse-history migration status at a glance. */
+function getHistoryBucketStats(hist) {
+  const users = Object.keys(hist || {}).length;
+  let days = 0;
+  let packedDays = 0;
+  let sparseDays = 0;
+  let quarterDays = 0;
+  let hourSparseDays = 0;
+  let legacyDays = 0;
+  let unknownDays = 0;
+
+  for (const userDays of Object.values(hist || {})) {
+    if (!userDays || typeof userDays !== 'object') continue;
+    for (const dayBuckets of Object.values(userDays)) {
+      days++;
+      if (typeof dayBuckets === 'string' && dayBuckets.startsWith(HISTORY_PACK_PREFIX)) packedDays++;
+      else if (Array.isArray(dayBuckets)) legacyDays++;
+      else if (dayBuckets && typeof dayBuckets === 'object') {
+        sparseDays++;
+        const keys = Object.keys(dayBuckets);
+        if (keys.some(k => /^q\d+$/.test(k))) quarterDays++;
+        else hourSparseDays++;
+      }
+      else unknownDays++;
+    }
+  }
+
+  return { users, days, packedDays, sparseDays, quarterDays, hourSparseDays, legacyDays, unknownDays };
+}
+
+function renderHistoryDebugBadge() {
+  const badge = $('historyDebugBadge');
+  if (!badge) return;
+
+  if (!DEBUG_HISTORY) {
+    badge.style.display = 'none';
+    return;
+  }
+
+  const s = getHistoryBucketStats(history);
+  badge.style.display = 'inline-flex';
+  badge.textContent = `history u:${s.users} d:${s.days} packed:${s.packedDays} q15:${s.quarterDays} sparseHr:${s.hourSparseDays} legacy:${s.legacyDays}${s.unknownDays ? ` unknown:${s.unknownDays}` : ''}`;
 }
 
 /**
@@ -229,15 +317,21 @@ function loadData() {
  * @param {object} members    - pinalove_members object keyed by username
  * @param {object} visitedMap - pinalove_visited map of username → unix timestamp when clicked
  */
-function buildAllUsers(members, visitedMap = {}) {
+function buildAllUsers(members, memberLocations = [], visitedMap = {}) {
   /* Derive latest scan ts directly from member.lastScanned (no pinalove_records). */
-  latestScanTs = Object.values(members || {}).reduce((mx, u) => Math.max(mx, u.lastScanned || 0), 0);
+  latestScanTs = Object.values(members || {}).reduce((mx, raw) => {
+    const sc = (raw && typeof raw === 'object') ? (raw.sc ?? raw.lastScanned ?? 0) : 0;
+    return Math.max(mx, sc || 0);
+  }, 0);
 
-  allUsers = Object.values(members).map(u => ({
+  allUsers = Object.entries(members || {}).map(([username, raw]) => {
+    const u = decodeMemberEntry(username, raw, memberLocations);
+    return ({
     ...u,
     isOnline:  latestScanTs > 0 && u.lastScanned === latestScanTs,
     visitedAt: visitedMap[u.username] || null,
-  }));
+    });
+  });
 }
 
 /* 
@@ -257,7 +351,7 @@ function populateLocations() {
   =====================================================
   
   These functions extract and format per-user online session data.
-  Activity is stored per hour in Philippine time and aggregated by day.
+  Activity may be stored in 15-minute slots (q0..q95) or legacy hourly buckets.
 */
 
 /*
@@ -270,23 +364,83 @@ function getDailyMinutesPH(username) {
   const nowPh = phNow();
   for (let d=29; d>=0; d--) {
     const day     = tsToPhDay(nowPh - d*86400000);
-    const buckets = userHist[day] || [];
-    const minutes = buckets.reduce((s, m) => s + (m||0), 0);
+    const buckets = getDayBuckets96(userHist[day]);
+    const minutes = buckets.reduce((s, m) => s + (m || 0), 0);
     result.push({ date: day, minutes: Math.round(minutes) });
   }
   return result;
 }
 
+/* Normalize one day bucket to a 96-slot (15-minute) array, supporting legacy formats. */
+function getDayBuckets96(dayBuckets) {
+  const out = new Array(96).fill(0);
+
+  if (typeof dayBuckets === 'string' && dayBuckets.startsWith(HISTORY_PACK_PREFIX)) {
+    try {
+      const raw = atob(dayBuckets.slice(HISTORY_PACK_PREFIX.length));
+      for (let i = 0; i < 96; i++) {
+        const byte = raw.charCodeAt(Math.floor(i / 2)) || 0;
+        const nibble = (i % 2 === 0) ? (byte >> 4) : (byte & 0x0f);
+        out[i] = Math.min(15, nibble);
+      }
+      return out;
+    } catch {
+      return out;
+    }
+  }
+
+  if (Array.isArray(dayBuckets)) {
+    if (dayBuckets.length >= 96) {
+      for (let slot = 0; slot < 96; slot++) {
+        out[slot] = Number(dayBuckets[slot] || 0);
+      }
+    } else {
+      for (let h = 0; h < 24; h++) {
+        const mins = Number(dayBuckets[h] || 0);
+        if (!mins) continue;
+        const base = Math.floor(mins / 4);
+        let rem = mins % 4;
+        for (let q = 0; q < 4; q++) {
+          out[(h * 4) + q] = base + (rem > 0 ? 1 : 0);
+          if (rem > 0) rem--;
+        }
+      }
+    }
+    for (let i = 0; i < 96; i++) out[i] = Math.round(out[i]);
+    return out;
+  }
+  if (!dayBuckets || typeof dayBuckets !== 'object') return out;
+  for (const [k, v] of Object.entries(dayBuckets)) {
+    const mins = Number(v || 0);
+    if (/^q\d+$/.test(k)) {
+      const slot = Number(k.slice(1));
+      if (!Number.isInteger(slot) || slot < 0 || slot > 95) continue;
+      out[slot] += mins;
+      continue;
+    }
+    const h = Number(k);
+    if (!Number.isInteger(h) || h < 0 || h > 23) continue;
+    const base = Math.floor(mins / 4);
+    let rem = mins % 4;
+    for (let q = 0; q < 4; q++) {
+      out[(h * 4) + q] += base + (rem > 0 ? 1 : 0);
+      if (rem > 0) rem--;
+    }
+  }
+  for (let i = 0; i < 96; i++) out[i] = Math.round(out[i]);
+  return out;
+}
+
 /*
-  Get hourly activity pattern across all days: sum each hour slot (0-23) from all days.
-  Returns array of 24 values (one per hour) summing total online minutes in that hour.
+  Get 15-minute activity pattern across all days.
+  Returns array of 96 values (one per quarter-hour) summing total online minutes.
 */
 function getHourlyPatternPH(username) {
   const userHist = history[username] || {};
-  const totals = new Array(24).fill(0);
-  for (const [k, buckets] of Object.entries(userHist)) {
-    if (!Array.isArray(buckets)) continue;
-    for (let h = 0; h < 24; h++) totals[h] += (buckets[h] || 0);
+  const totals = new Array(96).fill(0);
+  for (const buckets of Object.values(userHist)) {
+    const dayBuckets = getDayBuckets96(buckets);
+    for (let i = 0; i < 96; i++) totals[i] += (dayBuckets[i] || 0);
   }
   return totals;
 }
@@ -333,13 +487,21 @@ function buildSparkSVG(primary, secondary = [], opts = {}) {
   const interval = opts.interval ?? 5;
   const col1     = opts.color1   ?? 'rgba(0,201,167,0.65)';
   const col2     = opts.color2   ?? 'rgba(255,45,155,0.85)';
+  const bgSeries = opts.bgSeries ?? [];
+  const bgSecondary = opts.bgSecondary ?? [];
+  const bgCol    = opts.bgColor  ?? 'rgba(140,150,170,0.35)';
+  const bgCol2   = opts.bgColor2 ?? 'rgba(170,170,180,0.42)';
   const labelEvery = opts.labelEvery ?? 3;
   const numBars  = primary.length;
-  const max      = Math.max(...primary, 1);
+  const max      = Math.max(...primary, ...secondary, ...bgSeries, ...bgSecondary, 1);
   const barW     = Math.max(1, Math.round(VW / numBars) - (VW / numBars > 2 ? 1 : 0));
 
-  /* Build bars: each bar is a primary rect with optional secondary overlay */
+  /* Build bars: previous-day (grey) in back, then current-day primary, then secondary overlay. */
   const bars = primary.map((v, i) => {
+    const vb  = bgSeries[i] || 0;
+    const bgH = vb > 0 ? Math.max(1, Math.round((vb / max) * H)) : 0;
+    const vb2 = bgSecondary[i] || 0;
+    const bgH2 = vb2 > 0 ? Math.max(1, Math.round((vb2 / max) * H)) : 0;
     const bH  = Math.max(v > 0 ? 2 : 0, Math.round((v / max) * H));
     const v2  = secondary[i] || 0;
     const nH  = v2 > 0 ? Math.max(1, Math.round((v2 / max) * H)) : 0;
@@ -351,6 +513,8 @@ function buildSparkSVG(primary, secondary = [], opts = {}) {
       return `${hh}:${mm}`;
     })();
     return `<g>
+      ${bgH ? `<rect x="${x}" y="${H-bgH}" width="${barW}" height="${bgH}" rx="1" fill="${bgCol}"><title>${tip}</title></rect>` : ''}
+      ${bgH2 ? `<rect x="${x}" y="${H-bgH2}" width="${barW}" height="${bgH2}" rx="1" fill="${bgCol2}"><title>${tip}</title></rect>` : ''}
       <rect x="${x}" y="${H-bH}" width="${barW}" height="${bH}" rx="1"
         fill="${col1}" opacity="${v>0?1:0.1}"><title>${tip}</title></rect>
       ${nH ? `<rect x="${x}" y="${H-nH}" width="${barW}" height="${nH}" rx="1" fill="${col2}"><title>${tip}</title></rect>` : ''}
@@ -415,28 +579,49 @@ function renderHeaderSparkline() {
     d.setUTCHours(0, 0, 0, 0);
     return d.getTime() - PH_OFFSET_MS;
   })();
+  const prevDayPhMs = todayPhMs - 86400000;
 
-  /* Populate sparkline bins with peak counts for this day from totals array */
+  /* Populate sparkline bins with peak counts: previous day (grey) + current day (color). */
+  const prevPrimary = new Array(numBars).fill(0);
+  const prevSecondary = new Array(numBars).fill(0);
   const primary = new Array(numBars).fill(0);
   const secondary = new Array(numBars).fill(0);
-  let hasData = false;
+  let hasCurrent = false;
+  let hasPrev = false;
   for (const { ts, count, newCount } of totals) {
-    const offsetMs = ts - todayPhMs;
-    if (offsetMs < 0 || offsetMs >= 86400000) continue;
-    const slot = Math.floor(offsetMs / (interval * 60000));
-    if (slot < 0 || slot >= numBars) continue;
-    primary[slot]   = Math.max(primary[slot],   count    || 0);
-    secondary[slot] = Math.max(secondary[slot], newCount || 0);
-    hasData = true;
+    const todayOffset = ts - todayPhMs;
+    if (todayOffset >= 0 && todayOffset < 86400000) {
+      const slot = Math.floor(todayOffset / (interval * 60000));
+      if (slot >= 0 && slot < numBars) {
+        primary[slot]   = Math.max(primary[slot],   count    || 0);
+        secondary[slot] = Math.max(secondary[slot], newCount || 0);
+        hasCurrent = true;
+      }
+      continue;
+    }
+
+    const prevOffset = ts - prevDayPhMs;
+    if (prevOffset >= 0 && prevOffset < 86400000) {
+      const slot = Math.floor(prevOffset / (interval * 60000));
+      if (slot >= 0 && slot < numBars) {
+        prevPrimary[slot] = Math.max(prevPrimary[slot], count || 0);
+        prevSecondary[slot] = Math.max(prevSecondary[slot], newCount || 0);
+        hasPrev = true;
+      }
+    }
   }
 
-  if (!hasData) {
+  if (!hasCurrent && !hasPrev) {
     svgEl.innerHTML = '<text x="0" y="14" font-size="9" fill="var(--muted)">no scans today</text>';
     return;
   }
 
   svgEl.innerHTML = buildSparkSVG(primary, secondary, {
     vw: 600, h: 56, ah: 18, interval,
+    bgSeries: prevPrimary,
+    bgSecondary: prevSecondary,
+    bgColor: 'rgba(130,140,160,0.42)',
+    bgColor2: 'rgba(150,150,170,0.55)',
     tip: (i, v, v2) => {
       const phMin = i * interval;
       const hh = String(Math.floor(phMin/60)).padStart(2,'0');
@@ -1031,8 +1216,8 @@ function renderLazyBatch() {
   lazyIndex = end;
 
   /* Wire click handlers for profile modal (whole card) and external link (username <a>) */
-  grid.querySelectorAll('.profile-trigger:not([_wired])').forEach(el => {
-    el._wired = true;
+  grid.querySelectorAll('.profile-trigger:not([data-wired])').forEach(el => {
+    el.setAttribute('data-wired', '1');
     const wu = allUsers.find(u => u.username === el.dataset.username);
     if (wu?.visitedAt) applyVisitedBadge(wu.username);
     el.addEventListener('click', e => {
@@ -1132,12 +1317,12 @@ function setupLazyObserver() {
 */
 function renderSparkline(username) {
   const todayPH  = tsToPhDay(Date.now());
-  const hours    = ((history[username] || {})[todayPH] || []).map(m => m || 0);
-  const hasData  = hours.some(m => m > 0);
+  const slots15  = getDayBuckets96((history[username] || {})[todayPH]);
+  const hasData  = slots15.some(m => m > 0);
   if (!hasData) return `<div class="spark-empty">no activity today</div>`;
 
-  const interval = scanInterval || 5;
-  const primary  = expandHourlyToSlots(hours, interval);
+  const interval = 15;
+  const primary  = slots15;
 
   /* Fixed dimensions to prevent layout shifts */
   const VW = 120, H = 28, AH = 10;
@@ -1636,7 +1821,11 @@ async function openProfileModal(username, profileUrl, u, userIndex, existingModa
       </div>
     </div>`;
 
-  modal.querySelector('.modal-close').addEventListener('click', ()=>modal.remove());
+  modal.querySelector('.modal-close').addEventListener('click', e => {
+    e.preventDefault();
+    e.stopPropagation();
+    modal.remove();
+  });
   modal.addEventListener('click', e=>{ if(e.target===modal) modal.remove(); });
   modal.querySelector('.history-modal-btn').addEventListener('click', ()=>{ modal.remove(); openHistoryModal(username); });
 
@@ -1856,12 +2045,12 @@ async function saveProfileSnapshot(username, parsed) {
 // ─── Profile body render ──────────────────────────────────────────────────────
 
 function renderUserSparklineInto(username, container) {
-  const hours   = ((history[username] || {})[tsToPhDay(Date.now())] || []).map(m => m || 0);
-  const hasData = hours.some(m => m > 0);
+  const slots15 = getDayBuckets96((history[username] || {})[tsToPhDay(Date.now())]);
+  const hasData = slots15.some(m => m > 0);
   if (!hasData) { container.innerHTML = '<span style="font-size:9px;color:var(--muted)">no data yet</span>'; return; }
 
-  const interval = scanInterval || 5;
-  const primary  = expandHourlyToSlots(hours, interval);
+  const interval = 15;
+  const primary  = slots15;
 
   container.innerHTML = buildSparkSVG(primary, [], {
     vw: 220, h: 32, ah: 10, interval,
@@ -2120,24 +2309,14 @@ function openHistoryModal(username) {
 
   // ── Daily detail sparkline (interval-aware) ───────────────────────────
   function buildDailyDetail(dateStr) {
-    const buckets = (userHist[dateStr] || []).map(m => m || 0);
-    while (buckets.length < 24) buckets.push(0);
+    const buckets = getDayBuckets96(userHist[dateStr]);
     const hasData = buckets.some(m => m > 0);
 
     if (!hasData) return '<div style="color:var(--muted);font-size:11px;padding:8px 0">No data for this day</div>';
 
-    const interval = scanInterval || 5;
-    const numBars  = Math.round(1440 / interval);
-    const barBuckets = new Array(numBars).fill(0);
-    for (let h = 0; h < 24; h++) {
-      if (!buckets[h]) continue;
-      const startSlot = Math.round(h * 60 / interval);
-      const endSlot   = Math.round((h+1) * 60 / interval);
-      const slots     = endSlot - startSlot || 1;
-      for (let s = startSlot; s < endSlot && s < numBars; s++) {
-        barBuckets[s] += buckets[h] / slots;
-      }
-    }
+    const interval = 15;
+    const numBars  = 96;
+    const barBuckets = buckets;
 
     const maxVal = Math.max(...barBuckets, 1);
     const VW = 560; const H = 60; const AH = 18;
@@ -2413,7 +2592,7 @@ function bindEvents() {
     if (area !== 'local') return;
     let needRebuild = false;
 
-    if (changes.pinalove_history)  { history  = changes.pinalove_history.newValue  || {}; needRebuild = true; }
+    if (changes.pinalove_history)  { history  = changes.pinalove_history.newValue  || {}; needRebuild = true; renderHistoryDebugBadge(); }
     if (changes.pinalove_profiles) { profiles = decodeProfilesMap(changes.pinalove_profiles.newValue || {}); }
     if (changes.pinalove_settings) {
       const s = changes.pinalove_settings.newValue;
@@ -2425,9 +2604,9 @@ function bindEvents() {
     }
 
     /* pinalove_members is the primary data source — rebuild when it changes. */
-    if (changes.pinalove_members || changes.pinalove_visited) {
-      chrome.storage.local.get(['pinalove_members', 'pinalove_visited'], d => {
-        buildAllUsers(d.pinalove_members || {}, d.pinalove_visited || {});
+    if (changes.pinalove_members || changes.pinalove_member_locations || changes.pinalove_visited) {
+      chrome.storage.local.get(['pinalove_members', 'pinalove_member_locations', 'pinalove_visited'], d => {
+        buildAllUsers(d.pinalove_members || {}, d.pinalove_member_locations || [], d.pinalove_visited || {});
         populateLocations();
         applyAndRender();
         renderHeaderSparkline();
