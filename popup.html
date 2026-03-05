@@ -1,0 +1,365 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <title>Pinkerton</title>
+  <style>
+    *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+    :root{
+      --bg:#0a0a12;
+      --surf:#11111e;
+      --surf2:#181828;
+      --border:#252538;
+      --cyan:#00e5ff;
+      --magenta:#ff2d9b;
+      --magenta2:#ff70c0;
+      --coral:#ff6b6b;
+      --gold:#ffd166;
+      --lavender:#b388ff;
+      --teal:#00c9a7;
+      --muted:#7a7a9e;
+      --muted2:#a8a8c4;
+      --text:#e8e8f5;
+      --mono:'DM Mono',monospace;
+      --disp:'Syne',sans-serif;
+    }
+    body{width:380px;min-height:460px;max-height:600px;overflow:hidden;background:var(--bg);color:var(--text);font-family:var(--mono);font-size:12px;display:flex;flex-direction:column}
+
+    .header{background:linear-gradient(135deg,#0d001a 0%,#001020 100%);border-bottom:1px solid var(--border);padding:10px 16px;display:flex;align-items:center;justify-content:space-between;flex-shrink:0;position:relative;overflow:hidden}
+    .header::before{content:'';position:absolute;inset:0;background:linear-gradient(90deg,rgba(255,45,155,.07),rgba(0,229,255,.07));pointer-events:none}
+    .logo{font-family:var(--disp);font-size:18px;font-weight:800;letter-spacing:-.5px;line-height:1;position:relative}
+    .logo-pin{color:var(--magenta);text-shadow:0 0 14px rgba(255,45,155,.7)}
+    .logo-kerton{color:var(--cyan);text-shadow:0 0 14px rgba(0,229,255,.45)}
+    .logo-ver{font-size:10px;font-family:var(--mono);color:var(--muted2);font-weight:400;letter-spacing:1px;margin-left:6px}
+
+    .tabs{display:flex;border-bottom:1px solid var(--border);background:var(--surf);flex-shrink:0}
+    .tab{flex:1;padding:9px 4px;text-align:center;cursor:pointer;font-size:10px;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted);border-bottom:2px solid transparent;transition:all .15s}
+    .tab.active{color:var(--cyan);border-bottom-color:var(--cyan)}
+    .tab:hover:not(.active){color:var(--text)}
+
+    .panel{display:none;flex:1;overflow-y:auto;padding:12px 14px}
+    .panel.active{display:flex;flex-direction:column;gap:10px}
+    .panel::-webkit-scrollbar{width:4px}
+    .panel::-webkit-scrollbar-thumb{background:var(--border);border-radius:2px}
+
+    .stat-grid{display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:6px}
+    .stat-card{background:var(--surf);border:1px solid var(--border);border-radius:8px;padding:8px 6px;text-align:center;position:relative;overflow:hidden}
+    .stat-card::after{content:'';position:absolute;bottom:0;left:0;right:0;height:2px}
+    .stat-card .sv{font-family:var(--mono);font-size:18px;font-weight:500;line-height:1;letter-spacing:-.5px}
+    .stat-card .sl{font-size:8px;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted);margin-top:3px}
+    .stat-card.cyan  .sv{color:var(--cyan)}    .stat-card.cyan::after{background:var(--cyan)}
+    .stat-card.mag   .sv{color:var(--magenta)}.stat-card.mag::after{background:var(--magenta)}
+    .stat-card.gold  .sv{color:var(--gold)}    .stat-card.gold::after{background:var(--gold)}
+    .stat-card.lav   .sv{color:var(--lavender)}.stat-card.lav::after{background:var(--lavender)}
+
+    .spark-box{background:var(--surf);border:1px solid var(--border);border-radius:8px;padding:10px 12px}
+    .spark-title{font-size:9px;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted);margin-bottom:6px;display:flex;justify-content:space-between;align-items:center}
+    .spark-legend{font-size:9px;color:var(--muted);text-transform:none;letter-spacing:0}
+
+    .btn{flex:1;padding:7px 0;border-radius:6px;border:none;cursor:pointer;font-family:var(--mono);font-size:10px;font-weight:500;letter-spacing:1px;text-transform:uppercase;transition:all .15s;white-space:nowrap}
+    .btn-primary{background:linear-gradient(90deg,var(--magenta),var(--cyan));color:#000;font-weight:700}
+    .btn-primary:hover{opacity:.85}
+    .btn-primary:disabled{opacity:.35;cursor:default}
+    .btn-ghost{background:var(--surf);border:1px solid var(--border);color:var(--muted)}
+    .btn-ghost:hover{color:var(--text);border-color:var(--muted2)}
+    .btn-ghost:disabled{opacity:.4;cursor:default}
+    @keyframes gold-flash {
+      0%,100%     { background:rgba(0,229,255,.08); border-color:rgba(0,229,255,.3); color:var(--cyan); box-shadow:none }
+      90%          { background:rgba(0,229,255,.08); border-color:rgba(0,229,255,.3); color:var(--cyan); box-shadow:none }
+      93%          { background:rgba(255,200,0,.22); border-color:rgba(255,200,0,.8); color:#ffc800; box-shadow:0 0 12px rgba(255,200,0,.5) }
+      97%          { background:rgba(255,200,0,.22); border-color:rgba(255,200,0,.8); color:#ffc800; box-shadow:0 0 12px rgba(255,200,0,.5) }
+    }
+    .btn-results{background:rgba(0,229,255,.08);border:1px solid rgba(0,229,255,.3);color:var(--cyan);animation:gold-flash 3s ease-in-out infinite}
+    .btn-results:hover{background:rgba(0,229,255,.18);border-color:var(--cyan);box-shadow:0 0 10px rgba(0,229,255,.15)}
+    .btn-danger{background:rgba(255,107,107,.1);border:1px solid rgba(255,107,107,.25);color:var(--coral)}
+    .btn-danger:hover{background:rgba(255,107,107,.2)}
+
+    .progress-wrap{display:none}
+    .progress-pulse{height:2px;background:var(--border);border-radius:2px;overflow:hidden;margin-bottom:4px;position:relative}
+    .progress-pulse::after{content:'';position:absolute;top:0;left:-40%;width:40%;height:100%;background:linear-gradient(90deg,transparent,var(--magenta),var(--cyan),transparent);animation:pulse-slide 1.2s ease-in-out infinite}
+    @keyframes pulse-slide{0%{left:-40%}100%{left:110%}}
+    .progress-text{font-size:10px;color:var(--muted2);text-align:center}
+
+    .status{font-size:11px;min-height:16px;text-align:center}
+    .status.ok{color:var(--teal)}.status.err{color:var(--coral)}.status.info{color:var(--muted2)}
+
+    .countdown{font-size:10px;color:var(--muted);text-align:center;letter-spacing:1px}
+    .storage-bar-wrap{margin:6px 0 2px}
+    .storage-bar-row{display:flex;justify-content:space-between;margin-bottom:3px}
+    .storage-lbl{font-size:9px;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted)}
+    .storage-val{font-size:9px;font-family:var(--mono);color:var(--muted2)}
+    .storage-bar-bg{height:3px;background:var(--border);border-radius:2px;overflow:hidden}
+    .storage-bar-fill{height:100%;border-radius:2px;background:linear-gradient(90deg,var(--cyan),var(--magenta));transition:width .4s}
+    .countdown span{color:var(--cyan)}
+
+    .log-wrap{background:var(--surf);border:1px solid var(--border);border-radius:8px;overflow:hidden}
+    .log-header{display:flex;align-items:center;justify-content:space-between;padding:7px 10px;border-bottom:1px solid var(--border)}
+    .log-header-lbl{font-size:9px;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted)}
+    .log-header-count{font-size:10px;color:var(--muted2)}
+    .log-rows{max-height:130px;overflow-y:auto}
+    .log-rows::-webkit-scrollbar{width:3px}
+    .log-rows::-webkit-scrollbar-thumb{background:var(--border)}
+    .log-row{display:flex;align-items:center;gap:6px;padding:5px 10px;border-bottom:1px solid rgba(37,37,56,.6);font-size:10px}
+    .log-row:last-child{border-bottom:none}
+    .log-row:hover{background:rgba(255,255,255,.02)}
+    .log-time{color:var(--muted);flex-shrink:0;min-width:72px}
+    .log-badges{display:flex;gap:4px;flex:1;justify-content:flex-end}
+    .lb{font-size:9px;padding:1px 5px;border-radius:3px;font-weight:500}
+    .lb.g{background:rgba(0,201,167,.12);color:var(--teal);border:1px solid rgba(0,201,167,.25)}
+    .lb.y{background:rgba(255,209,102,.08);color:var(--gold);border:1px solid rgba(255,209,102,.2)}
+    .lb.b{background:rgba(0,229,255,.08);color:var(--cyan);border:1px solid rgba(0,229,255,.2)}
+    .lb.r{background:rgba(255,85,85,.1);color:#ff5555;border:1px solid rgba(255,85,85,.25)}
+    .log-row.err .log-time{color:#ff5555;opacity:0.7}
+    .log-empty{padding:12px;text-align:center;color:var(--muted);font-size:11px}
+
+    .setting-group{background:var(--surf);border:1px solid var(--border);border-radius:8px;overflow:hidden}
+    .setting-group-title{font-size:9px;letter-spacing:2px;text-transform:uppercase;color:var(--muted);padding:7px 12px;border-bottom:1px solid var(--border);background:var(--surf2)}
+    .setting-row{display:flex;align-items:center;justify-content:space-between;padding:9px 12px;border-bottom:1px solid rgba(37,37,56,.6);gap:10px}
+    .setting-row:last-child{border-bottom:none}
+    .setting-lbl{font-size:11px;color:var(--text)}
+    .setting-sub{font-size:9px;color:var(--muted);margin-top:1px}
+    .age-row{display:flex;align-items:center;gap:6px}
+    .age-input{width:48px;background:var(--bg);border:1px solid var(--border);border-radius:5px;padding:4px 6px;color:var(--text);font-family:var(--mono);font-size:11px;text-align:center}
+    .age-input:focus{outline:none;border-color:var(--cyan)}
+    .rate-btn{width:24px;height:24px;border-radius:5px;border:1px solid var(--border);background:var(--surf2);color:var(--text);font-size:16px;line-height:1;cursor:pointer;display:flex;align-items:center;justify-content:center;transition:all .15s}
+    .rate-btn:hover{border-color:var(--cyan);color:var(--cyan)}
+    .rate-btn:disabled{opacity:.3;cursor:default}
+
+    .info-logo{font-family:var(--disp);font-size:28px;font-weight:800;letter-spacing:-1px;text-align:center;margin:8px 0 4px}
+    .info-tagline{font-size:11px;color:var(--muted2);text-align:center;margin-bottom:12px;line-height:1.5}
+    .info-block{background:var(--surf);border:1px solid var(--border);border-radius:8px;padding:12px}
+    .info-block+.info-block{margin-top:8px}
+    .info-block-title{font-size:9px;letter-spacing:2px;text-transform:uppercase;color:var(--muted);margin-bottom:8px}
+    .info-block p{font-size:11px;color:var(--muted2);line-height:1.6;margin-bottom:6px}
+    .info-block p:last-child{margin-bottom:0}
+    .info-contact{display:flex;flex-direction:column;gap:5px}
+    .info-link{font-size:11px;color:var(--cyan);text-decoration:none;display:flex;align-items:center;gap:6px}
+    .info-link:hover{text-decoration:underline}
+    .info-version{font-size:10px;color:var(--muted);text-align:center;margin-top:4px}
+
+    .support-block{
+      border-color: rgba(255,45,155,.45);
+      background: linear-gradient(160deg, rgba(255,45,155,.10) 0%, rgba(0,229,255,.08) 100%);
+      box-shadow: 0 0 0 1px rgba(255,45,155,.15) inset, 0 10px 24px rgba(0,0,0,.28);
+    }
+    .support-title{
+      font-size: 11px;
+      letter-spacing: 1.6px;
+      color: #ffd166;
+      margin-bottom: 10px;
+      font-weight: 700;
+      text-transform: uppercase;
+      text-align: center;
+    }
+    .support-text{font-size:12px;color:#f0f4ff;line-height:1.55;text-align:center;margin-bottom:10px}
+    .donation-frame{
+      position: relative;
+      width: 100%;
+      height: 80px;
+      overflow: hidden;
+      border-radius: 10px;
+      border: 1px solid rgba(255,255,255,.20);
+      box-shadow: 0 0 0 1px rgba(0,229,255,.2) inset, 0 8px 18px rgba(0,0,0,.32);
+      background: rgba(7,10,20,.55);
+    }
+    .donation-frame iframe{position:absolute;top:0;left:0;bottom:0;right:0;width:100%;height:100%}
+    .support-label{font-size:10px;color:#ffd166;letter-spacing:1px;text-transform:uppercase;text-align:center;margin:10px 0 6px}
+    .bmc-wrap{display:flex;justify-content:center}
+    .bmc-link{
+      display:inline-flex;align-items:center;justify-content:center;gap:8px;
+      min-height:42px;padding:0 14px;border-radius:8px;
+      background:#FF5F5F;color:#ffffff;border:2px solid #000000;
+      font-family:'Poppins',sans-serif;font-size:14px;font-weight:700;
+      text-decoration:none;box-shadow:0 4px 10px rgba(0,0,0,.28);
+      transition:transform .12s ease, filter .12s ease;
+    }
+    .bmc-link:hover{filter:brightness(1.06);transform:translateY(-1px)}
+    .bmc-emoji{font-size:18px;line-height:1}
+    .bmc-cup{font-size:18px;line-height:1;color:#FFDD00}
+  </style>
+</head>
+<body>
+  <div class="header">
+    <div class="logo">
+      <span class="logo-pin">Pin</span><span class="logo-kerton">kerton</span><span class="logo-ver">v3.5</span>
+    </div>
+    <button class="btn btn-results" id="openResultsBtn" style="flex:0;padding:5px 10px;font-size:10px">⊞ Open Interface</button>
+  </div>
+
+  <div class="tabs">
+    <div class="tab active" data-tab="dash">Dashboard</div>
+    <div class="tab" data-tab="settings">Settings</div>
+    <div class="tab" data-tab="info">Info</div>
+  </div>
+
+  <div class="panel active" id="tab-dash">
+    <div class="stat-grid">
+      <div class="stat-card cyan"><div class="sv" id="d-online">—</div><div class="sl">Online</div></div>
+      <div class="stat-card gold"><div class="sv" id="d-new">—</div><div class="sl">New</div></div>
+      <div class="stat-card mag"><div class="sv" id="d-premium">—</div><div class="sl">Premium</div></div>
+      <div class="stat-card lav"><div class="sv" id="d-verified">—</div><div class="sl">Verified</div></div>
+    </div>
+
+    <div class="spark-box">
+      <div class="spark-title">
+        <span>Today — Filipino time</span>
+        <span class="spark-legend">
+          <span style="color:var(--teal)">▪</span> online &nbsp;
+          <span style="color:var(--magenta)">▪</span> new
+        </span>
+      </div>
+      <div id="sparkContainer"><span style="font-size:10px;color:var(--muted)">No data yet</span></div>
+    </div>
+
+    <div class="status info" id="statusMsg"></div>
+    <div class="progress-wrap" id="progressWrap">
+      <div class="progress-pulse"></div>
+      <div class="progress-text" id="progressText"></div>
+    </div>
+    <div class="countdown" id="countdown" style="display:none">Next scan in <span id="countdownVal">—</span></div>
+
+    <div class="storage-bar-wrap" id="storageWrap">
+      <div class="storage-bar-row">
+        <span class="storage-lbl">Storage</span>
+        <span class="storage-val" id="storageVal">—</span>
+      </div>
+      <div class="storage-bar-bg"><div class="storage-bar-fill" id="storageBarFill"></div></div>
+    </div>
+
+    <div class="log-wrap">
+      <div class="log-header">
+        <span class="log-header-lbl">Scan Log</span>
+        <span class="log-header-count" id="logCount">0 scans</span>
+      </div>
+      <div class="log-rows" id="logRows">
+        <div class="log-empty">No scans yet</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="panel" id="tab-settings">
+    <div class="setting-group">
+      <div class="setting-group-title">Scan</div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-lbl">Scan Rate</div>
+          <div class="setting-sub">Minutes between auto-scans</div>
+        </div>
+        <div style="display:flex;align-items:center;gap:8px">
+          <button class="rate-btn" id="rateDown">−</button>
+          <span id="rateVal" style="font-size:13px;font-weight:600;color:var(--text);min-width:18px;text-align:center">5</span>
+          <button class="rate-btn" id="rateUp">+</button>
+          <span style="font-size:10px;color:var(--muted)">min</span>
+        </div>
+      </div>
+      <div class="setting-row" style="margin-top:4px">
+        <button class="btn btn-primary" id="autoScanBtn" style="width:100%;justify-content:center">▶ Start Automatic Scanning</button>
+      </div>
+    </div>
+
+    <div class="setting-group">
+      <div class="setting-group-title">Scan Parameters</div>
+      <div class="setting-row">
+        <div class="setting-lbl">Gender</div>
+        <select class="sort-select" id="scanGender" style="flex:0;min-width:160px">
+          <option value="f">Girls</option>
+          <option value="flb">Girls + Ladyboys</option>
+          <option value="lb">Ladyboys</option>
+          <option value="m">Guys</option>
+        </select>
+      </div>
+      <div class="setting-row">
+        <div class="setting-lbl">Age range</div>
+        <div class="age-row">
+          <input class="age-input" type="number" id="scanAgeMin" placeholder="18" min="18" max="99">
+          <span style="color:var(--muted)">–</span>
+          <input class="age-input" type="number" id="scanAgeMax" placeholder="99" min="18" max="99">
+        </div>
+      </div>
+    </div>
+
+    <div class="setting-group">
+      <div class="setting-group-title">Your Profile (for comparison)</div>
+      <div class="setting-row">
+        <div class="setting-lbl">Height (cm)</div>
+        <input class="age-input" type="number" id="myHeight" placeholder="170" min="120" max="250" style="flex:0">
+      </div>
+      <div class="setting-row">
+        <div class="setting-lbl">Weight (kg)</div>
+        <input class="age-input" type="number" id="myWeight" placeholder="70" min="30" max="200" style="flex:0">
+      </div>
+      <div class="setting-row" style="font-size:9px;color:var(--muted);padding:6px 12px;border:none">
+        Optional — used to display relative size comparison when viewing profiles.
+      </div>
+    </div>
+
+
+
+    <div class="setting-group">
+      <div class="setting-group-title">Data</div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-lbl">Clear scan data</div>
+          <div class="setting-sub">Deletes all records, history &amp; cache</div>
+        </div>
+        <button class="btn btn-danger" id="clearBtn" style="flex:0;padding:6px 12px">Delete</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="panel" id="tab-info">
+    <div style="text-align:center;margin:8px 0 6px"><img src="icons/icon128.png" style="width:64px;height:64px;border-radius:14px"></div>
+    <div class="info-logo"><span class="logo-pin">Pin</span><span class="logo-kerton">kerton</span></div>
+    <div class="info-tagline">Smarter PinaLove activity insights,<br>navigation, and profile tools for Chrome</div>
+
+    <div class="info-block">
+      <div class="info-block-title">What it does</div>
+      <p>Pinkerton tracks PinaLove activity over time and turns raw browsing into clear signals. All data stays local in your browser.</p>
+      <p>It can help reduce scam risk by highlighting suspicious patterns (for example, profiles that appear online almost all the time, or very old profiles with unusual behaviour) so you can decide more carefully.</p>
+      <p>It also helps you catch new members early, including users who are online only briefly, while giving you faster navigation than the default PinaLove flow.</p>
+      <p>You get live online/new/premium/verified stats, 24h and monthly activity views, profile change tracking, photo insights, and smoother profile-to-profile browsing.</p>
+    </div>
+
+    <div class="info-block">
+      <div class="info-block-title">How to use</div>
+      <p>1. Log in to pinalove.com — Pinkerton opens it automatically when you click the extension icon.</p>
+      <p>2. Go to <strong>Settings</strong>, set your scan rate (1–5 min) and filters (gender, age range), then press <strong>▶ Start Automatic Scanning</strong>.</p>
+      <p>3. Click <strong>⊞ Open Interface</strong> in the header to open the full results page.</p>
+    </div>
+
+    <div class="info-block">
+      <div class="info-block-title">Scan settings</div>
+      <p><strong>Scan Rate</strong> — how often Pinkerton fetches online users (1 to 5 minutes).</p>
+      <p><strong>Gender</strong> — filter scans to Women, Men, or Both.</p>
+      <p><strong>Age range</strong> — narrow the scanned population by minimum and maximum age.</p>
+      <p><strong>Auto-scan</strong> — runs in the background even when the popup is closed. Toggle it off to pause.</p>
+    </div>
+
+    <div class="info-block">
+      <div class="info-block-title">Interface features</div>
+      <p><strong>Search &amp; filters</strong> — search by username, filter by membership type, sort by last seen, name, or join date.</p>
+      <p><strong>Card view</strong> — click any card to open the profile modal; click the username to visit the PinaLove profile page.</p>
+      <p><strong>Table view</strong> — same behaviour, lazy-loaded for speed.</p>
+      <p><strong>Profile modal</strong> — shows photos, bio, field history, 24h sparkline, and a monthly activity chart. Navigate between profiles with Prev/Next.</p>
+    </div>
+
+    <div class="info-block support-block">
+      <div class="support-title">Support Pinkerton</div>
+      <div class="support-text">If this extension helps you find better matches and avoid bad profiles, your support keeps updates and improvements coming.</div>
+      <div class="support-label">Development Support</div>
+      <div class="bmc-wrap">
+        <a class="bmc-link" href="https://www.buymeacoffee.com/pinkerton" target="_blank" rel="noopener noreferrer" aria-label="Buy Pinkerton a coffee">
+          <span class="bmc-emoji">😎</span>
+          <span>Buy Pinkerton a coffee</span>
+          <span class="bmc-cup">☕</span>
+        </a>
+      </div>
+      <div class="support-text" style="margin-top:10px;margin-bottom:0">You can also request a specific feature through your donation note, and I will prioritize it based on support.</div>
+    </div>
+
+    <div class="info-version">Pinkerton v3.5 · Chrome Extension</div>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>
