@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Pinkerton Privacy Policy</title>
+  <style>
+    :root {
+      --bg: #0b1020;
+      --card: #121a2e;
+      --text: #e8eefc;
+      --muted: #a9b6d9;
+      --accent: #59d4ff;
+      --border: #24304f;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: Segoe UI, Arial, sans-serif;
+      background: linear-gradient(180deg, #090f1d 0%, #0b1020 100%);
+      color: var(--text);
+      line-height: 1.6;
+    }
+    .wrap {
+      max-width: 860px;
+      margin: 32px auto;
+      padding: 0 16px;
+    }
+    .card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 24px;
+    }
+    h1, h2 { margin: 0 0 10px; }
+    h1 { font-size: 30px; letter-spacing: 0.2px; }
+    h2 { font-size: 19px; margin-top: 24px; color: var(--accent); }
+    p, li { color: var(--text); }
+    .muted { color: var(--muted); }
+    a { color: var(--accent); }
+    ul { margin-top: 8px; }
+    .footer {
+      margin-top: 22px;
+      padding-top: 14px;
+      border-top: 1px solid var(--border);
+      color: var(--muted);
+      font-size: 14px;
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <h1>Pinkerton Privacy Policy</h1>
+      <p class="muted"><strong>Effective date:</strong> March 5, 2026</p>
+
+      <p>
+        Pinkerton is a Chrome extension that helps users analyze activity on PinaLove pages.
+        This policy explains what data Pinkerton processes, how it is used, and your choices.
+      </p>
+
+      <h2>1. Data We Process</h2>
+      <p>Pinkerton processes data from pages you use on <code>pinalove.com</code> to provide core features.</p>
+      <ul>
+        <li><strong>Website content:</strong> profile fields, profile text, profile images/links, and related page content needed for scans and analysis.</li>
+        <li><strong>User activity signals:</strong> scan timestamps, online/offline status over time, and derived activity trends.</li>
+        <li><strong>Basic profile identifiers:</strong> username, profile URL, and profile metadata shown on the site.</li>
+        <li><strong>Extension settings:</strong> scan interval, filter preferences, and optional comparison settings you enter.</li>
+      </ul>
+
+      <h2>2. How We Use Data</h2>
+      <ul>
+        <li>Show dashboard statistics and activity trends.</li>
+        <li>Enable filtering, navigation, and profile history features.</li>
+        <li>Support optional profile comparison visualizations.</li>
+        <li>Improve reliability (for example, migration and storage housekeeping).</li>
+      </ul>
+
+      <h2>3. Data Storage</h2>
+      <p>
+        Pinkerton stores data locally in your browser using <code>chrome.storage.local</code>.
+        Data is retained only for extension functionality and can be removed by using the in-extension
+        delete/clear option.
+      </p>
+
+      <h2>4. Data Sharing and Selling</h2>
+      <p>
+        Pinkerton does <strong>not</strong> sell personal data. Pinkerton does <strong>not</strong> transfer collected
+        extension data to a separate developer backend for monetization.
+      </p>
+
+      <h2>5. Permissions</h2>
+      <p>Pinkerton requests only permissions required for core operation:</p>
+      <ul>
+        <li><strong>alarms:</strong> run scheduled scans.</li>
+        <li><strong>host permissions (pinalove.com):</strong> access relevant pages/endpoints.</li>
+        <li><strong>scripting:</strong> inject packaged content scripts on matching pages.</li>
+        <li><strong>storage:</strong> save local settings/history.</li>
+        <li><strong>tabs:</strong> open/focus and coordinate extension workflows.</li>
+      </ul>
+
+      <h2>6. Security</h2>
+      <p>
+        Pinkerton follows Chrome Extension Manifest V3 constraints and keeps executable code bundled
+        with the extension package.
+      </p>
+
+      <h2>7. Your Choices</h2>
+      <ul>
+        <li>You can stop scanning at any time in extension settings.</li>
+        <li>You can clear stored extension data at any time from the Settings tab.</li>
+        <li>You can uninstall the extension to remove future processing.</li>
+      </ul>
+
+      <h2>8. Changes to This Policy</h2>
+      <p>
+        This policy may be updated when Pinkerton features or compliance requirements change.
+        The latest version will be published at this page URL.
+      </p>
+
+      <h2>9. Contact</h2>
+      <p>
+        For privacy questions, contact: <a href="mailto:was.seen@gmail.com">was.seen@gmail.com</a>
+      </p>
+
+      <div class="footer">
+        Pinkerton Chrome Extension Privacy Policy
+      </div>
+    </div>
+  </div>
+</body>
+</html>
