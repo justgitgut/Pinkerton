@@ -23,7 +23,7 @@ const $ = id => document.getElementById(id);
 /* PH is UTC+8 — used when bucketing totals into "today in Manila". */
 const PH_OFFSET_MS = 8 * 3600 * 1000;
 
-/* All-time members database — populated by loadAll(). Used for New/Premium/Verified totals. */
+/* Members database keyed by username, including scan flags + lastScanned timestamp. */
 let members  = {};
 
 /* Array of { ts, count, newCount } — one entry per completed scan. */
@@ -39,6 +39,7 @@ let scanInterval = 5;
 let scanGender = 'f';
 let scanAgeMin = 18;
 let scanAgeMax = 99;
+let clearNewAfterDays = 2;
 
 /* User's own height (cm) and weight (kg) — used for size comparisons in profiles. */
 let myHeight = null;
@@ -57,6 +58,7 @@ function decodeMembersMap(rawMembers = {}, memberLocations = []) {
         isNew: !!e.isNew,
         isPremium: !!e.isPremium,
         isVerified: !!e.isVerified,
+        lastScanned: e.lastScanned ?? 0,
       };
       continue;
     }
@@ -65,9 +67,16 @@ function decodeMembersMap(rawMembers = {}, memberLocations = []) {
       isNew: !!(flags & 1),
       isPremium: !!(flags & 2),
       isVerified: !!(flags & 4),
+      lastScanned: e.sc ?? 0,
     };
   }
   return out;
+}
+
+function clampClearNewAfterDays(v) {
+  const n = parseInt(v, 10);
+  if (!Number.isFinite(n)) return 2;
+  return Math.min(7, Math.max(1, n));
 }
 
 /*
@@ -158,6 +167,7 @@ function loadAll() {
         if (data.pinalove_settings?.scanGender)   scanGender   = data.pinalove_settings.scanGender;
         if (data.pinalove_settings?.scanAgeMin)   scanAgeMin   = data.pinalove_settings.scanAgeMin;
         if (data.pinalove_settings?.scanAgeMax)   scanAgeMax   = data.pinalove_settings.scanAgeMax;
+        clearNewAfterDays = clampClearNewAfterDays(data.pinalove_settings?.clearNewAfterDays ?? 2);
         if (data.pinalove_settings?.myHeight)     myHeight     = data.pinalove_settings.myHeight;
         if (data.pinalove_settings?.myWeight)     myWeight     = data.pinalove_settings.myWeight;
         autoEnabled = !!data.pinalove_settings?.autoScanEnabled;
@@ -186,17 +196,33 @@ function renderDashboard() {
  * Displays '—' if no scan data is available yet.
  */
 function renderStats() {
-  /* Online = count from the latest successful scan entry in pinalove_totals. */
+  /* Latest successful scan entry in totals (used as fallback if member snapshot is unavailable). */
   const latestOk = [...totals].reverse().find(t => t && t.count !== null && t.count !== undefined);
-  $('d-online').textContent = latestOk ? latestOk.count : '—';
 
-  /* New/Premium/Verified = totals across all members ever seen (not just this scan).
-     These reflect the full accumulated database, not just who is online right now. */
   const memberList = Object.values(members);
-  const hasMembers = memberList.length > 0;
-  $('d-new').textContent      = hasMembers ? memberList.filter(u => u.isNew).length      : '—';
-  $('d-premium').textContent  = hasMembers ? memberList.filter(u => u.isPremium).length  : '—';
-  $('d-verified').textContent = hasMembers ? memberList.filter(u => u.isVerified).length : '—';
+  const latestScanTs = memberList.reduce((mx, u) => Math.max(mx, Number(u.lastScanned || 0)), 0);
+  const latestUsers = latestScanTs > 0 ? memberList.filter(u => Number(u.lastScanned || 0) === latestScanTs) : [];
+
+  if (latestUsers.length > 0) {
+    $('d-online').textContent   = latestUsers.length;
+    $('d-new').textContent      = latestUsers.filter(u => u.isNew).length;
+    $('d-premium').textContent  = latestUsers.filter(u => u.isPremium).length;
+    $('d-verified').textContent = latestUsers.filter(u => u.isVerified).length;
+    return;
+  }
+
+  if (latestOk) {
+    $('d-online').textContent   = latestOk.count ?? '—';
+    $('d-new').textContent      = latestOk.newCount ?? 0;
+    $('d-premium').textContent  = 0;
+    $('d-verified').textContent = 0;
+    return;
+  }
+
+  $('d-online').textContent   = '—';
+  $('d-new').textContent      = '—';
+  $('d-premium').textContent  = '—';
+  $('d-verified').textContent = '—';
 }
 
 /* ─── Shared sparkline SVG builder ──────────────────────────────────────────── */
@@ -731,7 +757,7 @@ function bindEvents() {
       btn.classList.add('btn-primary');
     }
     /* Disable scan parameter controls while auto-scan is running. */
-    const lockIds = ['scanGender', 'scanAgeMin', 'scanAgeMax', 'clearBtn', 'rateDown', 'rateUp'];
+    const lockIds = ['scanGender', 'scanAgeMin', 'scanAgeMax', 'clearNewAfterDays', 'clearBtn', 'rateDown', 'rateUp'];
     lockIds.forEach(id => { const el = $(id); if (el) el.disabled = enabled; });
   }
 
@@ -766,6 +792,7 @@ function bindEvents() {
       s.scanGender = scanGender;
       s.scanAgeMin = scanAgeMin;
       s.scanAgeMax = scanAgeMax;
+      s.clearNewAfterDays = clearNewAfterDays;
       chrome.storage.local.set({ pinalove_settings: s });
     });
   }
@@ -774,6 +801,7 @@ function bindEvents() {
     const gEl   = $('scanGender');
     const minEl = $('scanAgeMin');
     const maxEl = $('scanAgeMax');
+    const clearNewEl = $('clearNewAfterDays');
 
     /* Initialise input values from loaded settings; register change handlers. */
     if (gEl) {
@@ -789,6 +817,14 @@ function bindEvents() {
       /* Show blank instead of "99" (the default maximum age). */
       maxEl.value = scanAgeMax === 99 ? '' : scanAgeMax;
       maxEl.addEventListener('change', () => { scanAgeMax = parseInt(maxEl.value) || 99; saveScanParams(); });
+    }
+    if (clearNewEl) {
+      clearNewEl.value = String(clearNewAfterDays);
+      clearNewEl.addEventListener('change', () => {
+        clearNewAfterDays = clampClearNewAfterDays(clearNewEl.value);
+        clearNewEl.value = String(clearNewAfterDays);
+        saveScanParams();
+      });
     }
   }
   initScanParamUI();
@@ -845,7 +881,7 @@ function bindEvents() {
       }
     }
 
-    /* Members database updated — re-render New/Premium/Verified totals. */
+    /* Members database updated — recompute latest-scan snapshot counters. */
     if (changes.pinalove_members || changes.pinalove_member_locations) {
       chrome.storage.local.get(['pinalove_members', 'pinalove_member_locations'], data => {
         members = decodeMembersMap(data.pinalove_members || {}, data.pinalove_member_locations || []);
@@ -857,6 +893,9 @@ function bindEvents() {
     if (changes.pinalove_settings) {
       const s = changes.pinalove_settings.newValue;
       if (s?.scanInterval) { scanInterval = s.scanInterval; renderSparkline(); }
+      clearNewAfterDays = clampClearNewAfterDays(s?.clearNewAfterDays ?? clearNewAfterDays);
+      const clearNewEl = $('clearNewAfterDays');
+      if (clearNewEl) clearNewEl.value = String(clearNewAfterDays);
     }
 
     /* New totals entry (appended after each scan) — re-render sparkline. */

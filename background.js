@@ -43,6 +43,9 @@ const MEMBER_DIFF_AGE = 8;
 const MEMBER_DIFF_LOCATION = 16;
 const MEMBER_DIFF_PHOTO = 32;
 const MEMBER_LOG_MAX = 10;
+const NEW_FLAG_DEFAULT_DAYS = 2;
+const NEW_FLAG_MIN_DAYS = 1;
+const NEW_FLAG_MAX_DAYS = 7;
 
 /* Base URL for all PinaLove requests. */
 const BASE = 'https://www.pinalove.com';
@@ -157,6 +160,16 @@ function normalizeMemberLog(rawLog = null) {
   return [];
 }
 
+function joinMonthToTs(joinMonth) {
+  const jm = (joinMonth || '').trim();
+  if (!/^\d{4}-\d{2}$/.test(jm)) return 0;
+  const [yStr, mStr] = jm.split('-');
+  const y = Number(yStr);
+  const m = Number(mStr);
+  if (!Number.isInteger(y) || !Number.isInteger(m) || m < 1 || m > 12) return 0;
+  return Date.UTC(y, m - 1, 1);
+}
+
 function compactMemberEntry(raw, username, locations, locationToIndex) {
   const src = raw && typeof raw === 'object' ? raw : {};
   const isCompact = ('sc' in src) || ('ls' in src) || ('f' in src) || ('l' in src);
@@ -165,27 +178,46 @@ function compactMemberEntry(raw, username, locations, locationToIndex) {
     const locIdx = (typeof src.l === 'number')
       ? src.l
       : ensureLocationIndex(src.location || '', locations, locationToIndex);
+    const joinMonth = src.j ?? src.joinMonth ?? null;
+    const estimatedTs = joinMonthToTs(joinMonth);
+    const rawTs = Number(src.r ?? src.rt ?? src.registeredAt ?? 0) || 0;
+    const registeredAt = rawTs || estimatedTs || 0;
+    const registeredAtImprecise = (src.ri != null)
+      ? !!src.ri
+      : (!!estimatedTs && !rawTs);
     return {
       a: src.a ?? src.age ?? null,
       l: (typeof locIdx === 'number') ? locIdx : null,
       p: src.p || canonicalPhotoId(src.photoUrl) || '',
       f: Number.isInteger(src.f) ? src.f : memberFlags(src.isNew, src.isPremium, src.isVerified),
-      j: src.j ?? src.joinMonth ?? null,
+      j: joinMonth,
       ls: src.ls ?? src.lastSeen ?? src.sc ?? src.lastScanned ?? 0,
       fs: src.fs ?? src.firstSeen ?? src.sc ?? src.lastScanned ?? 0,
+      r: registeredAt,
+      ri: registeredAtImprecise ? 1 : 0,
       sc: src.sc ?? src.lastScanned ?? 0,
       g: normalizeMemberLog(src.g ?? src.changelog),
     };
   }
+
+  const joinMonth = src.joinMonth ?? null;
+  const estimatedTs = joinMonthToTs(joinMonth);
+  const rawTs = Number(src.registeredAt ?? src.rt ?? 0) || 0;
+  const registeredAt = rawTs || estimatedTs || 0;
+  const registeredAtImprecise = (src.ri != null)
+    ? !!src.ri
+    : (!!estimatedTs && !rawTs);
 
   return {
     a: src.age ?? null,
     l: ensureLocationIndex(src.location || '', locations, locationToIndex),
     p: canonicalPhotoId(src.photoUrl) || '',
     f: memberFlags(!!src.isNew, !!src.isPremium, !!src.isVerified),
-    j: src.joinMonth ?? null,
+    j: joinMonth,
     ls: src.lastSeen ?? src.lastScanned ?? 0,
     fs: src.firstSeen ?? src.lastScanned ?? 0,
+    r: registeredAt,
+    ri: registeredAtImprecise ? 1 : 0,
     sc: src.lastScanned ?? 0,
     g: normalizeMemberLog(src.changelog),
   };
@@ -779,14 +811,14 @@ function parseThumbdata(html) {
   /* Locate the `thumbs:` key that introduces the array. */
   const start = html.indexOf('thumbs:');
   if (start === -1) {
-    console.error('[Pinkerton] thumbdata.thumbs not found in response');
+    console.warn('[Pinkerton] thumbdata.thumbs not found in response');
     return null;
   }
 
   /* Find the opening `[` of the thumbs array. */
   const bracketOpen = html.indexOf('[', start);
   if (bracketOpen === -1) {
-    console.error('[Pinkerton] thumbs array open bracket not found');
+    console.warn('[Pinkerton] thumbs array open bracket not found');
     return null;
   }
 
@@ -810,7 +842,7 @@ function parseThumbdata(html) {
 
     return JSON.parse(jsonStr);
   } catch (e) {
-    console.error('[Pinkerton] thumbdata parse error:', e.message, raw.slice(0, 200));
+    console.warn('[Pinkerton] thumbdata parse miss:', e.message, raw.slice(0, 200));
     return null;
   }
 }
@@ -1093,7 +1125,12 @@ async function scanUntilOffline() {
       const msg = isTimeout
         ? `Page ${pageNum} timed out after ${FETCH_TIMEOUT_MS / 1000}s — scan discarded`
         : err.message;
-      console.error('[Pinkerton] fetch error page', pageNum, msg);
+      if (isTimeout) {
+        // Timeouts are expected occasionally; surface as warning, not extension error.
+        console.warn('[Pinkerton] fetch timeout page', pageNum, msg);
+      } else {
+        console.error('[Pinkerton] fetch error page', pageNum, msg);
+      }
       await setProgress({ type: 'error', message: msg });
       /* Log the failure to pinalove_totals so the dashboard shows a red row.
          We do this even though no user data was saved — the log entry is the
@@ -1264,11 +1301,16 @@ async function storeFailedScan(ts, reason) {
  */
 async function mergeMembersFromScan(scanTs, users) {
   return new Promise(resolve => {
-    chrome.storage.local.get(['pinalove_members', 'pinalove_member_locations'], data => {
+    chrome.storage.local.get(['pinalove_members', 'pinalove_member_locations', 'pinalove_settings'], data => {
       const members = data.pinalove_members || {};
       let locations = Array.isArray(data.pinalove_member_locations) ? [...data.pinalove_member_locations] : [];
       const locationToIndex = new Map(locations.map((v, i) => [v, i]));
       const cutoff  = Date.now() - 30 * 86400000; // 30-day retention window
+      const cfgDaysRaw = parseInt(data.pinalove_settings?.clearNewAfterDays, 10);
+      const clearNewAfterDays = Number.isFinite(cfgDaysRaw)
+        ? Math.min(NEW_FLAG_MAX_DAYS, Math.max(NEW_FLAG_MIN_DAYS, cfgDaysRaw))
+        : NEW_FLAG_DEFAULT_DAYS;
+      const clearNewAfterMs = clearNewAfterDays * 86400000;
 
       /* Normalize any legacy member entries to compact form before merging. */
       for (const [username, raw] of Object.entries(members)) {
@@ -1285,6 +1327,7 @@ async function mergeMembersFromScan(scanTs, users) {
         const newAge = (u.age == null ? null : u.age);
         const newLastSeen = u.lastSeen ?? scanTs;
         const newJoinMonth = u.joinMonth || null;
+        const estimatedJoinTs = joinMonthToTs(newJoinMonth);
 
         if (!existing) {
           /* New user — insert compact record. */
@@ -1296,6 +1339,8 @@ async function mergeMembersFromScan(scanTs, users) {
             j: newJoinMonth,
             ls: newLastSeen,
             fs: scanTs,
+            r: estimatedJoinTs || scanTs,
+            ri: estimatedJoinTs ? 1 : 0,
             sc: scanTs,
             g: [],
           };
@@ -1325,6 +1370,13 @@ async function mergeMembersFromScan(scanTs, users) {
           existing.l = (typeof locIdx === 'number') ? locIdx : null;
           if (newJoinMonth && (!existing.j || newJoinMonth < existing.j)) existing.j = newJoinMonth;
           if (!existing.fs) existing.fs = scanTs;
+          if (!Number(existing.r || 0)) {
+            const fallbackEstimatedTs = joinMonthToTs(existing.j || newJoinMonth || '');
+            existing.r = fallbackEstimatedTs || existing.fs || scanTs;
+            existing.ri = fallbackEstimatedTs ? 1 : 0;
+          } else if (existing.ri == null) {
+            existing.ri = 0;
+          }
         }
       }
 
@@ -1333,7 +1385,20 @@ async function mergeMembersFromScan(scanTs, users) {
          so a user who reappears briefly doesn't keep a long-inactive entry alive. */
       for (const username of Object.keys(members)) {
         const m = members[username];
-        const age = m.ls ?? m.lastSeen ?? m.sc ?? m.lastScanned ?? 0;
+        const age = Number(m.ls ?? m.lastSeen ?? m.sc ?? m.lastScanned ?? 0) || 0;
+
+          /* Auto-expire "new" status when the member has been inactive/offline for configured days.
+           This keeps dashboard "new" counters aligned with recent activity rather than
+           permanently retaining stale new flags for users who stop appearing in scans. */
+          if ((Number(m.f || 0) & MEMBER_FLAG_NEW) && age > 0 && (scanTs - age) >= clearNewAfterMs) {
+          m.f = Number(m.f || 0) & ~MEMBER_FLAG_NEW;
+          m.g = normalizeMemberLog(m.g);
+          m.g.push([scanTs, MEMBER_DIFF_NEW]);
+          if (m.g.length > MEMBER_LOG_MAX) {
+            m.g = m.g.slice(m.g.length - MEMBER_LOG_MAX);
+          }
+        }
+
         if (age < cutoff) delete members[username];
       }
 
@@ -1520,6 +1585,27 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         const photos     = [...photoMap.keys()];
         const photoStats = [...photoMap.values()];
 
+        /* Try to capture the current avatar directly from profile payload/html.
+           This is used by the results page to detect avatar replacements even
+           when the browse-list avatar is stale. */
+        let avatarPhoto = '';
+        const avatarCandidates = [
+          (html.match(/\bavatar\s*:\s*"((?:[^"\\]|\\.)*)"/i) || [])[1],
+          (html.match(/"avatar"\s*:\s*"((?:[^"\\]|\\.)*)"/i) || [])[1],
+          (html.match(/\bavatar\s*:\s*'((?:[^'\\]|\\.)*)'/i) || [])[1],
+          (html.match(/'avatar'\s*:\s*'((?:[^'\\]|\\.)*)'/i) || [])[1],
+          (html.match(/\bprofilephoto\s*:\s*"((?:[^"\\]|\\.)*)"/i) || [])[1],
+          (html.match(/\bprofilephoto\s*:\s*'((?:[^'\\]|\\.)*)'/i) || [])[1],
+          (html.match(/<img[^>]+class=["'][^"']*profile[^"']*avatar[^"']*["'][^>]+src=["']([^"']+)["']/i) || [])[1],
+        ];
+        for (const candidate of avatarCandidates) {
+          if (!candidate) continue;
+          const uri = unesc(candidate).trim();
+          if (!uri || uri.includes('/i/nophoto') || !uri.includes('/p/')) continue;
+          avatarPhoto = canonicalPath(uri);
+          break;
+        }
+
         /* Infer the earliest possible join month from photo path dates (YYYY-MM/...). */
         const allMonths     = photos
           .map(p => { const r = p.match(/^(\d{4}-\d{2})\//); return r ? r[1] : null; })
@@ -1546,7 +1632,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
           return;
         }
 
-        sendResponse({ data: { title, bio, fields, photos, photoStats, joinMonth: earliestMonth } });
+        sendResponse({ data: { title, bio, fields, photos, photoStats, avatarPhoto, joinMonth: earliestMonth } });
 
           /* Keep lightweight metadata in members (joinMonth only). */
           mergeMembersFromProfile(request.username, { joinMonth: earliestMonth })

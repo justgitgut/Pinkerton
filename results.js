@@ -22,6 +22,8 @@ const MEMBER_BASE_URL = 'https://www.pinalove.com';
 
 /* Flat array of all member profiles cached from the extension (pinalove_members storage) */
 let allUsers      = [];
+let knownUsernames = new Set();
+let refreshNewUsers = new Set();
 
 /* Filtered/sorted subset of allUsers based on active filters (search, age, location, type) */
 let filteredUsers = [];
@@ -39,6 +41,9 @@ let history       = {};
   Stores photo URLs, field values, bio, and timestamped changes
 */
 let profiles      = {};
+let profileAvatarOverrides = {};
+let profileCacheOrder = [];
+const PROFILE_CACHE_LIMIT = 10;
 
 /* 
   Global activity log: array of scan timestamps with online/new counts
@@ -60,8 +65,15 @@ let myWeight      = null;
 */
 let latestScanTs  = 0;
 
-/* Enable migration counters via ?debug=1 or ?debugHistory=1 (or #debug). */
-const DEBUG_HISTORY = /(?:[?&]debug=1\b|[?&]debugHistory=1\b)/i.test(location.search) || /debug(?:history)?/i.test(location.hash);
+/* Enable migration counters via URL params/hash, with optional runtime toggle via logo taps. */
+const DEBUG_HISTORY_DEFAULT = /(?:[?&]debug=1\b|[?&]debugHistory=1\b)/i.test(location.search) || /debug(?:history)?/i.test(location.hash);
+let debugHistoryEnabled = DEBUG_HISTORY_DEFAULT;
+let logoDebugTapCount = 0;
+let logoDebugTapTimer = null;
+
+function isDebugEnabled() {
+  return !!debugHistoryEnabled;
+}
 
 /* Compact storage schema for profile fields in pinalove_profiles. */
 const FIELD_KEY_MAP = {
@@ -100,13 +112,18 @@ function unpackProfileFields(packed = {}) {
 
 function decodeProfileEntry(raw) {
   if (!raw || typeof raw !== 'object') {
-    return { fields: {}, bio: '', title: '', photos: [], diffs: [], joinMonth: null };
+    return { fields: {}, bio: '', title: '', photos: [], currentPhotos: [], currentAvatar: '', diffs: [], joinMonth: null };
   }
+  const photos = Array.isArray(raw.photos) ? raw.photos : (Array.isArray(raw.p) ? raw.p : []);
+  const currentPhotos = Array.isArray(raw.currentPhotos) ? raw.currentPhotos : (Array.isArray(raw.cp) ? raw.cp : photos);
+  const currentAvatar = raw.currentAvatar ?? raw.ca ?? currentPhotos[0] ?? '';
   return {
     fields: raw.fields ? { ...raw.fields } : unpackProfileFields(raw.f || {}),
     bio: raw.bio ?? raw.b ?? '',
     title: raw.title ?? raw.t ?? '',
-    photos: Array.isArray(raw.photos) ? raw.photos : (Array.isArray(raw.p) ? raw.p : []),
+    photos,
+    currentPhotos,
+    currentAvatar,
     diffs: Array.isArray(raw.diffs) ? raw.diffs : (Array.isArray(raw.d) ? raw.d : []),
     joinMonth: raw.joinMonth ?? raw.jm ?? null,
   };
@@ -118,6 +135,8 @@ function encodeProfileEntry(entry) {
     t: entry.title || '',
     b: entry.bio || '',
     p: (entry.photos || []).map(stripPhotoUrl).filter(Boolean),
+    cp: (entry.currentPhotos || entry.photos || []).map(stripPhotoUrl).filter(Boolean),
+    ca: stripPhotoUrl(entry.currentAvatar || ''),
     d: entry.diffs || [],
     jm: entry.joinMonth || null,
   };
@@ -142,6 +161,8 @@ function decodeMemberEntry(username, raw, locations = []) {
       isPremium: !!entry.isPremium,
       isVerified: !!entry.isVerified,
       joinMonth: entry.joinMonth ?? null,
+      registeredAt: entry.registeredAt ?? entry.rt ?? 0,
+      registeredAtImprecise: !!entry.ri,
       lastSeen: entry.lastSeen ?? 0,
       firstSeen: entry.firstSeen ?? 0,
       lastScanned: entry.lastScanned ?? 0,
@@ -160,11 +181,28 @@ function decodeMemberEntry(username, raw, locations = []) {
     isPremium: !!(flags & 2),
     isVerified: !!(flags & 4),
     joinMonth: entry.j ?? null,
+    registeredAt: entry.r ?? entry.rt ?? 0,
+    registeredAtImprecise: !!entry.ri,
     lastSeen: entry.ls ?? 0,
     firstSeen: entry.fs ?? 0,
     lastScanned: entry.sc ?? 0,
     profileUrl: `${MEMBER_BASE_URL}/${username}`,
   };
+}
+
+function isEarlyMorningNewUser(user) {
+  const ts = Number(user?.registeredAt || 0);
+  if (!user?.isNew || !ts || user?.registeredAtImprecise) return false;
+  const hour = tsToPhHour(ts);
+  return hour >= 2 && hour < 5;
+}
+
+function nicknameColorStyle(user) {
+  return isEarlyMorningNewUser(user) ? ' style="color:#ff8c00"' : '';
+}
+
+function isNewlyAddedOnRefresh(user) {
+  return !!(user?.username && refreshNewUsers.has(user.username));
 }
 
 /* Lazy loading: current batch index for grid/table rendering */
@@ -236,7 +274,7 @@ document.addEventListener('DOMContentLoaded', () => { bindEvents(); loadData(); 
   then renders the main view with applied filters.
 */
 function loadData() {
-  chrome.storage.local.get(['pinalove_members','pinalove_member_locations','pinalove_filters','pinalove_history','pinalove_profiles','pinalove_totals','pinalove_settings','pinalove_visited'], data => {
+  chrome.storage.local.get(['pinalove_members','pinalove_member_locations','pinalove_filters','pinalove_history','pinalove_totals','pinalove_settings','pinalove_visited','pinalove_profiles'], data => {
     /* Restore active filters from storage (age range, sort, type filters) */
     if (data.pinalove_filters) {
       const f = data.pinalove_filters;
@@ -250,9 +288,15 @@ function loadData() {
     if (data.pinalove_settings?.scanInterval) scanInterval = data.pinalove_settings.scanInterval;
     if (data.pinalove_settings?.myHeight)     myHeight     = data.pinalove_settings.myHeight;
     if (data.pinalove_settings?.myWeight)     myWeight     = data.pinalove_settings.myWeight;
-    profiles = decodeProfilesMap(data.pinalove_profiles || {});
+    /* Keep profiles lazy to avoid pinning all bios/titles in page memory. */
+    profiles = {};
+    profileCacheOrder = [];
+    profileAvatarOverrides = extractProfileAvatarMap(data.pinalove_profiles || {});
     totals   = data.pinalove_totals   || [];
+    renderMemoryDebugBadge();
     buildAllUsers(data.pinalove_members || {}, data.pinalove_member_locations || [], data.pinalove_visited || {});
+    knownUsernames = new Set(allUsers.map(u => u.username));
+    refreshNewUsers = new Set();
     populateLocations();
     syncFilterUI();
     applyAndRender();
@@ -261,6 +305,24 @@ function loadData() {
     const hasData = Object.keys(data.pinalove_members || {}).length > 0;
     if (!hasData) { const b = $('debugBar'); if (b) b.style.display='block'; }
   });
+}
+
+function extractProfileAvatarMap(rawProfiles = {}) {
+  const out = {};
+  for (const [username, raw] of Object.entries(rawProfiles || {})) {
+    if (!raw || typeof raw !== 'object') continue;
+    const avatar = stripPhotoUrl(
+      raw.currentAvatar
+      || raw.ca
+      || (Array.isArray(raw.currentPhotos) ? raw.currentPhotos[0] : '')
+      || (Array.isArray(raw.cp) ? raw.cp[0] : '')
+      || (Array.isArray(raw.photos) ? raw.photos[0] : '')
+      || (Array.isArray(raw.p) ? raw.p[0] : '')
+      || ''
+    );
+    if (avatar) out[username] = avatar;
+  }
+  return out;
 }
 
 /* Build compact counts to verify sparse-history migration status at a glance. */
@@ -295,16 +357,63 @@ function getHistoryBucketStats(hist) {
 
 function renderHistoryDebugBadge() {
   const badge = $('historyDebugBadge');
-  if (!badge) return;
+  const panel = $('sidebarDebugPanel');
+  if (!badge || !panel) return;
 
-  if (!DEBUG_HISTORY) {
-    badge.style.display = 'none';
+  if (!isDebugEnabled()) {
+    panel.style.display = 'none';
     return;
   }
+  panel.style.display = 'grid';
 
   const s = getHistoryBucketStats(history);
-  badge.style.display = 'inline-flex';
-  badge.textContent = `history u:${s.users} d:${s.days} packed:${s.packedDays} q15:${s.quarterDays} sparseHr:${s.hourSparseDays} legacy:${s.legacyDays}${s.unknownDays ? ` unknown:${s.unknownDays}` : ''}`;
+  badge.innerHTML = `
+    <tr><td>Metric</td><td>Value</td></tr>
+    <tr><td>Users</td><td>${s.users}</td></tr>
+    <tr><td>Days</td><td>${s.days}</td></tr>
+    <tr><td>Packed</td><td>${s.packedDays}</td></tr>
+    <tr><td>q15</td><td>${s.quarterDays}</td></tr>
+    <tr><td>SparseHr</td><td>${s.hourSparseDays}</td></tr>
+    <tr><td>Legacy</td><td>${s.legacyDays}</td></tr>
+    ${s.unknownDays ? `<tr><td>Unknown</td><td>${s.unknownDays}</td></tr>` : ''}
+  `;
+}
+
+function approxBytes(value) {
+  try { return JSON.stringify(value).length; }
+  catch { return 0; }
+}
+
+function fmtKb(bytes) {
+  return `${(bytes / 1024).toFixed(1)}KB`;
+}
+
+function renderMemoryDebugBadge() {
+  const badge = $('memoryDebugBadge');
+  const panel = $('sidebarDebugPanel');
+  if (!badge || !panel) return;
+
+  if (!isDebugEnabled()) {
+    panel.style.display = 'none';
+    return;
+  }
+  panel.style.display = 'grid';
+
+  const bUsers = approxBytes(allUsers);
+  const bHist = approxBytes(history);
+  const bTotals = approxBytes(totals);
+  const bProfiles = approxBytes(profiles);
+  const total = bUsers + bHist + bTotals + bProfiles;
+
+  badge.innerHTML = `
+    <tr><td>Metric</td><td>Value</td></tr>
+    <tr><td>Total</td><td>${fmtKb(total)}</td></tr>
+    <tr><td>Users</td><td>${fmtKb(bUsers)}</td></tr>
+    <tr><td>History</td><td>${fmtKb(bHist)}</td></tr>
+    <tr><td>Totals</td><td>${fmtKb(bTotals)}</td></tr>
+    <tr><td>Profiles</td><td>${fmtKb(bProfiles)}</td></tr>
+    <tr><td>Cache N</td><td>${profileCacheOrder.length}</td></tr>
+  `;
 }
 
 /**
@@ -326,6 +435,8 @@ function buildAllUsers(members, memberLocations = [], visitedMap = {}) {
 
   allUsers = Object.entries(members || {}).map(([username, raw]) => {
     const u = decodeMemberEntry(username, raw, memberLocations);
+    const profileAvatar = stripPhotoUrl(profileAvatarOverrides[username] || '');
+    if (profileAvatar) u.photoUrl = profileAvatar;
     return ({
     ...u,
     isOnline:  latestScanTs > 0 && u.lastScanned === latestScanTs,
@@ -1094,19 +1205,31 @@ function computeFiltered() {
   
   /* Sort by active key */
   const lastSeenTs = u => u.lastSeen || 0;
-  const joinTs = u => {
-    /* joinMonth from scan record ("2025-07") or stored profile */
-    const jm = u.joinMonth || (profiles[u.username]||{}).joinMonth || null;
-    if (!jm) return Infinity; /* unknown → push to end on asc, start on desc */
-    const [y,m] = jm.split('-');
-    return new Date(+y, +m-1).getTime();
-  };
+  const joinTs = u => Number(u.registeredAt || 0) || 0;
 
   switch (sortKey) {
     case 'name_asc':         r.sort((a,b)=>(a.username||'').localeCompare(b.username||'')); break;
     case 'name_desc':        r.sort((a,b)=>(b.username||'').localeCompare(a.username||'')); break;
-    case 'join_asc':         r.sort((a,b)=>joinTs(a)-joinTs(b)); break;
-    case 'join_desc':        r.sort((a,b)=>joinTs(b)-joinTs(a)); break;
+    case 'join_asc':
+      r.sort((a, b) => {
+        const at = joinTs(a);
+        const bt = joinTs(b);
+        if (at && bt) return at - bt;
+        if (at && !bt) return -1;
+        if (!at && bt) return 1;
+        return (a.username || '').localeCompare(b.username || '');
+      });
+      break;
+    case 'join_desc':
+      r.sort((a, b) => {
+        const at = joinTs(a);
+        const bt = joinTs(b);
+        if (at && bt) return bt - at;
+        if (at && !bt) return -1;
+        if (!at && bt) return 1;
+        return (a.username || '').localeCompare(b.username || '');
+      });
+      break;
     case 'online_time_desc': r.sort((a,b)=>totalMinutes(b.username)-totalMinutes(a.username)); break;
     case 'online_time_asc':  r.sort((a,b)=>totalMinutes(a.username)-totalMinutes(b.username)); break;
     case 'last_seen_desc':   r.sort((a,b)=>lastSeenTs(b)-lastSeenTs(a)); break;
@@ -1119,7 +1242,7 @@ function computeFiltered() {
 }
 
 /* Apply filters, sort, and reset lazy index to 0 (re-render from start) */
-function applyAndRender() { filteredUsers=computeFiltered(); lazyIndex=0; render(); }
+function applyAndRender() { filteredUsers=computeFiltered(); lazyIndex=0; render(); renderMemoryDebugBadge(); }
 
 /* Persist current filter selections to storage */
 function saveFilters() { chrome.storage.local.set({pinalove_filters:{ageMin,ageMax,sort:sortKey,typeFilters}}); }
@@ -1148,21 +1271,28 @@ function saveFilters() { chrome.storage.local.set({pinalove_filters:{ageMin,ageM
 function render() {
   const main = $('mainContent');
 
-  /* 
-    Header pills show aggregate stats across ALL members:
-    - Online: users seen in the most recent scan (isOnline flag)
-    - New: total members flagged as new by PinaLove
-    - Premium: total members flagged as premium
-    - Verified: total members flagged as verified
+  /*
+    Header pills show aggregate stats across all cached members.
+    Online remains the subset seen in the latest scan.
   */
   const onlineCount   = allUsers.filter(u => u.isOnline).length;
   const newCount      = allUsers.filter(u => u.isNew).length;
   const premiumCount  = allUsers.filter(u => u.isPremium).length;
   const verifiedCount = allUsers.filter(u => u.isVerified).length;
+  const windowStartTs = Date.now() - 24 * 3600000;
+  const users24h = allUsers.filter(u => Number(u.lastScanned || 0) >= windowStartTs);
+  const online24h = users24h.length;
+  const new24h = users24h.filter(u => u.isNew).length;
+  const premium24h = users24h.filter(u => u.isPremium).length;
+  const verified24h = users24h.filter(u => u.isVerified).length;
   $('hOnline').textContent   = onlineCount;
   $('hNew').textContent      = newCount;
   $('hPremium').textContent  = premiumCount;
   $('hVerified').textContent = verifiedCount;
+  $('h24Online').textContent = online24h;
+  $('h24New').textContent = new24h;
+  $('h24Premium').textContent = premium24h;
+  $('h24Verified').textContent = verified24h;
   $('resultCount').innerHTML = `<strong>${filteredUsers.length}</strong> of ${allUsers.length}`;
 
   if (!allUsers.length) {
@@ -1186,7 +1316,7 @@ function render() {
   } else {
     /* Table view: creates lazy-loadable row table + sentinel */
     main.innerHTML = `<div class="table-wrap"><table class="user-table" id="lazyTable">
-      <thead><tr><th></th><th>Username</th><th>Age</th><th>Location</th><th>Joined</th><th>Type</th><th>Today (PH)</th><th>30d online</th></tr></thead>
+      <thead><tr><th></th><th>Username</th><th>Age</th><th>Location</th><th title="Joined">📅</th><th>Type</th><th>Today (PH)</th><th>30d online</th></tr></thead>
       <tbody id="lazyTableBody"></tbody>
     </table></div><div class="lazy-sentinel" id="lazySentinel"><span class="lazy-spinner">…</span></div>`;
     lazyIndex = 0;
@@ -1220,6 +1350,17 @@ function renderLazyBatch() {
     el.setAttribute('data-wired', '1');
     const wu = allUsers.find(u => u.username === el.dataset.username);
     if (wu?.visitedAt) applyVisitedBadge(wu.username);
+
+    const cardImg = el.querySelector('.card-photo-wrap img');
+    if (cardImg && !cardImg.dataset.errWired) {
+      cardImg.dataset.errWired = '1';
+      cardImg.addEventListener('error', () => {
+        cardImg.style.display = 'none';
+        const ph = el.querySelector('.card-photo-placeholder');
+        if (ph) ph.style.display = 'flex';
+      });
+    }
+
     el.addEventListener('click', e => {
       if (e.target.closest('a')) return;
       e.preventDefault(); e.stopPropagation();
@@ -1246,18 +1387,21 @@ function renderLazyTableBatch() {
   for (let i = lazyIndex; i < end; i++) {
     const u     = filteredUsers[i];
     const href  = u.profileUrl || '#';
+    const newAtCreation = isNewlyAddedOnRefresh(u);
     const thumb = u.photoUrl
-      ? `<div style="cursor:pointer"><img src="${thumbPhotoUrl(u.photoUrl)}" style="width:34px;height:38px;object-fit:cover;border-radius:4px;display:block" loading="lazy"></div>`
+      ? `<div class="table-thumb-wrap${newAtCreation ? ' newly-added' : ''}" style="cursor:pointer" title="Profile photo"><img src="${escAttr(thumbPhotoUrl(u.photoUrl))}" style="width:34px;height:38px;object-fit:cover;border-radius:4px;display:block" loading="lazy"></div>`
       : `<div style="width:34px;height:38px;border-radius:4px;background:var(--surf2);display:flex;align-items:center;justify-content:center;font-size:15px">👤</div>`;
-    const name   = `<a href="${href}" target="_blank" class="user-link" onclick="event.stopPropagation()">${esc(u.username||'?')}</a>`;
-    const extras = [u.isNew?'✨':'', u.isPremium?'👑':'', u.isVerified?'✅':''].filter(Boolean).join(' ');
+    const name   = `<a href="${escAttr(href)}" target="_blank" class="user-link" title="Open profile"${nicknameColorStyle(u)}>${esc(u.username||'?')}</a>`;
+    const extras = [
+      u.isNew ? '<span title="New">✨</span>' : '',
+      u.isPremium ? '<span title="Premium">👑</span>' : '',
+      u.isVerified ? '<span title="Verified">✅</span>' : '',
+    ].filter(Boolean).join(' ');
     const tot    = totalMinutes(u.username);
     const jmCell = (() => {
-      const jm = u.joinMonth || (profiles[u.username]||{}).joinMonth || null;
-      if (!jm) return `<td style="color:var(--muted2);font-size:10px">—</td>`;
-      const [y, mo] = jm.split('-');
-      const lbl = '\u2264\u202f' + new Date(+y, +mo-1).toLocaleDateString('en-US', {month:'short', year:'numeric'});
-      return `<td style="color:${joinColor(jm)};font-size:10px;white-space:nowrap;font-weight:600">${lbl}</td>`;
+      const joined = getJoinedDisplay(u);
+      if (!joined) return `<td style="color:var(--muted2);font-size:10px">—</td>`;
+      return `<td title="User joined date" style="color:${joined.color};font-size:10px;white-space:nowrap;font-weight:600">${esc(joined.text)}</td>`;
     })();
     const tr = document.createElement('tr');
     tr.dataset.username = u.username;
@@ -1269,7 +1413,7 @@ function renderLazyTableBatch() {
       <td style="color:var(--muted2)">${esc(u.location||'—')}</td>
       ${jmCell}
       <td>${extras||'—'}</td>
-      <td><div class="table-spark-wrap">${renderSparkline(u.username)}</div></td>
+      <td><div class="table-spark-wrap" title="Today activity (PH)">${renderSparkline(u.username)}</div></td>
       <td style="color:var(--muted2);font-size:10px;white-space:nowrap">${tot ? fmtMinutes(tot) : '—'}</td>`;
     if (u.visitedAt) tr.classList.add('visited');
     tr.addEventListener('click', e => {
@@ -1360,6 +1504,38 @@ function joinColor(jm) {
   return `rgb(${r},${g},30)`;
 }
 
+function getJoinedDisplay(user) {
+  const exactTs = Number(user?.registeredAt || 0);
+  if (exactTs > 0 && !user?.registeredAtImprecise) {
+    return {
+      text: new Date(exactTs).toLocaleString('en-PH', {
+        timeZone: 'Asia/Manila',
+        month: 'short',
+        day: '2-digit',
+        year: 'numeric',
+        hour: '2-digit',
+        minute: '2-digit',
+        hour12: true,
+      }),
+      color: 'var(--teal)',
+    };
+  }
+
+  const fallbackTs = exactTs || (() => {
+    const jm = user?.joinMonth || (profiles[user?.username] || {}).joinMonth || null;
+    if (!jm) return 0;
+    const [y, m] = jm.split('-');
+    return new Date(+y, +m - 1).getTime();
+  })();
+  if (!fallbackTs) return null;
+  const d = new Date(fallbackTs);
+  const jm = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+  return {
+    text: '\u2264\u202f' + d.toLocaleDateString('en-US', { month: 'short', year: 'numeric' }),
+    color: joinColor(jm),
+  };
+}
+
 /*
   Render a single user profile card for grid view.
   Includes: thumbnail photo, name link, metadata (age/location), join date, and 24h sparkline.
@@ -1369,25 +1545,26 @@ function joinColor(jm) {
 function renderCard(u) {
   const href    = u.profileUrl||'#';
   const nameTxt = esc(u.username||'?');
-  const photo   = u.photoUrl ? `<img src="${thumbPhotoUrl(u.photoUrl)}" alt="${nameTxt}" loading="lazy" onerror="this.style.display='none';this.nextElementSibling.style.display='flex'">` : '';
-  const ph      = `<div class="card-photo-placeholder" style="${u.photoUrl?'display:none':''}">👤</div>`;
+  const newAtCreation = isNewlyAddedOnRefresh(u);
+  const avatarId = getPreferredAvatarId(u.username, u.photoUrl);
+  const photo   = avatarId ? `<img src="${escAttr(thumbPhotoUrl(avatarId))}" alt="${nameTxt}" loading="lazy">` : '';
+  const ph      = `<div class="card-photo-placeholder" style="${avatarId?'display:none':''}">👤</div>`;
   const meta    = [u.age?`${u.age}`:null, u.location?esc(u.location):null].filter(Boolean).join(', ');
-  const jm      = u.joinMonth || (profiles[u.username]||{}).joinMonth || null;
-  const joinLbl = jm ? (() => { const [y,m] = jm.split('-'); return '\u2264\u202f'+new Date(+y,+m-1).toLocaleDateString('en-US',{month:'short',year:'numeric'}); })() : null;
+  const joined  = getJoinedDisplay(u);
   const spark   = renderSparkline(u.username);
 
-  return `<div class="user-card profile-trigger" data-username="${u.username}" data-url="${href}" style="cursor:pointer">
-    <div class="card-photo-wrap">
+  return `<div class="user-card profile-trigger${newAtCreation ? ' newly-added' : ''}" data-username="${escAttr(u.username)}" data-url="${escAttr(href)}" style="cursor:pointer" title="Open profile details">
+    <div class="card-photo-wrap${newAtCreation ? ' newly-added' : ''}">
       ${photo}${ph}
       ${u.isVerified ? `<span class="card-tag verified" title="Verified">✓</span>` : ''}
       ${u.isPremium  ? `<span class="card-tag premium"  title="Premium">👑</span>` : ''}
       ${u.isNew      ? `<span class="card-tag new"      title="New">NEW</span>`    : ''}
     </div>
     <div class="card-body">
-      <div class="card-name"><a href="${href}" target="_blank" class="user-link" onclick="event.stopPropagation()">${nameTxt}</a></div>
+      <div class="card-name"><a href="${escAttr(href)}" target="_blank" class="user-link" title="Open profile"${nicknameColorStyle(u)}>${nameTxt}</a></div>
       ${meta ? `<div class="card-meta">${meta}</div>` : ''}
-      ${joinLbl ? `<div class="card-join" style="color:${joinColor(jm)}">Joined ${joinLbl}</div>` : ''}
-      <div class="card-spark-row">${spark}</div>
+      ${joined ? `<div class="card-join" title="User joined date" style="color:${joined.color}">📅 ${esc(joined.text)}</div>` : ''}
+      <div class="card-spark-row" title="Today activity (PH)">${spark}</div>
     </div>
   </div>`;
 }
@@ -1478,7 +1655,7 @@ function pruneAndAdvance(modal, username, userIndex, icon, headline) {
         const next = filteredUsers[userIndex];
         openProfileModal(next.username, next.profileUrl || '#', next, userIndex, modal);
       } else {
-        modal.remove();
+        closeProfileModal(modal);
       }
       return;
     }
@@ -1686,6 +1863,43 @@ function applyVisitedBadge(username) {
   });
 }
 
+function releaseProfileCache(username) {
+  if (!username) return;
+  delete profiles[username];
+  profileCacheOrder = profileCacheOrder.filter(u => u !== username);
+}
+
+function touchProfileCache(username) {
+  if (!username) return;
+  profileCacheOrder = profileCacheOrder.filter(u => u !== username);
+  profileCacheOrder.push(username);
+  while (profileCacheOrder.length > PROFILE_CACHE_LIMIT) {
+    const evict = profileCacheOrder.shift();
+    if (evict) delete profiles[evict];
+  }
+}
+
+function closeProfileModal(modal) {
+  if (!modal) return;
+  releaseProfileCache(modal.dataset.activeUsername || '');
+  if (modal.isConnected) modal.remove();
+}
+
+function getPreferredAvatarId(username, fallback = '') {
+  const entry = profiles[username] || {};
+  return stripPhotoUrl(entry.currentAvatar || '')
+    || stripPhotoUrl(fallback || '')
+    || stripPhotoUrl((entry.currentPhotos || [])[0] || '')
+    || stripPhotoUrl((entry.photos || [])[0] || '');
+}
+
+function renderModalAvatarHtml(username, fallback = '') {
+  const avatarId = getPreferredAvatarId(username, fallback);
+  return avatarId
+    ? `<img src="${escAttr(thumbPhotoUrl(avatarId))}" class="pf-avatar">`
+    : `<div class="pf-avatar-ph">&#x1F464;</div>`;
+}
+
 async function openProfileModal(username, profileUrl, u, userIndex, existingModal) {
   // Mark as visited with timestamp directly on user object
   const visitedTs = Date.now();
@@ -1707,19 +1921,20 @@ async function openProfileModal(username, profileUrl, u, userIndex, existingModa
   // ── If reusing an existing modal, just update its internals ──────────
   if (existingModal) {
     const modal = existingModal;
+    const prevUsername = modal.dataset.activeUsername || '';
+    if (prevUsername && prevUsername !== username) releaseProfileCache(prevUsername);
+    modal.dataset.activeUsername = username;
 
     // Update identity block
-    modal.querySelector('.pf-avatar-wrap').innerHTML = u?.photoUrl
-      ? `<img src="${thumbPhotoUrl(u.photoUrl)}" class="pf-avatar">`
-      : `<div class="pf-avatar-ph">&#x1F464;</div>`;
+    modal.querySelector('.pf-avatar-wrap').innerHTML = renderModalAvatarHtml(username, u?.photoUrl || '');
     modal.querySelector('.pf-username').innerHTML =
-      `<a href="${profileUrl}" target="_blank" class="user-link">${esc(username)}</a>`;
+      `<a href="${escAttr(profileUrl)}" target="_blank" class="user-link"${nicknameColorStyle(u)}>${esc(username)}</a>`;
     const visitedLabel = u?.visitedAt ? '🔍 ' + fmtVisited(u.visitedAt) : '';
     modal.querySelector('.pf-usermeta').textContent =
       [u?.age ? u.age+' yr' : '', u?.location, visitedLabel].filter(Boolean).join(' · ');
     // Badges now inline with username
     modal.querySelector('.pf-username').innerHTML =
-      `<a href="${profileUrl}" target="_blank" class="user-link">${esc(username)}</a>${badges ? ' '+badges : ''}`;
+      `<a href="${escAttr(profileUrl)}" target="_blank" class="user-link"${nicknameColorStyle(u)}>${esc(username)}</a>${badges ? ' '+badges : ''}`;
 
     // Update nav button states
     modal.querySelector('.pf-prev-btn').disabled = userIndex <= 0;
@@ -1738,7 +1953,7 @@ async function openProfileModal(username, profileUrl, u, userIndex, existingModa
     modal.querySelector('.pf-next-btn').addEventListener('click', () => {
       if (userIndex < filteredUsers.length-1) { const n = filteredUsers[userIndex+1]; openProfileModal(n.username, n.profileUrl||'#', n, userIndex+1, modal); }
     });
-    modal.querySelector('.history-modal-btn').addEventListener('click', () => { modal.remove(); openHistoryModal(username); });
+    modal.querySelector('.history-modal-btn').addEventListener('click', () => { closeProfileModal(modal); openHistoryModal(username); });
 
     // Update bio block (will be filled in after profile fetch)
     const bioEl = modal.querySelector('#pfHeaderBio');
@@ -1754,6 +1969,7 @@ async function openProfileModal(username, profileUrl, u, userIndex, existingModa
       const parsed = { ...data, ts: Date.now() };
       if (!parsed.joinMonth && u?.joinMonth) parsed.joinMonth = u.joinMonth;
       await saveProfileSnapshot(username, parsed);
+      modal.querySelector('.pf-avatar-wrap').innerHTML = renderModalAvatarHtml(username, u?.photoUrl || '');
       renderProfileBody(username, parsed, modal.querySelector('#profileModalBody'));
     } catch(err) {
       const status = err.message.startsWith('PROFILE_STATUS:') ? err.message.slice(15) : null;
@@ -1774,6 +1990,7 @@ async function openProfileModal(username, profileUrl, u, userIndex, existingModa
   // ── First open: create the modal DOM ─────────────────────────────────
   const modal = document.createElement('div');
   modal.className = 'modal-overlay';
+  modal.dataset.activeUsername = username;
   modal.innerHTML = `
     <div class="modal profile-modal">
       <div class="pf-header">
@@ -1782,12 +1999,12 @@ async function openProfileModal(username, profileUrl, u, userIndex, existingModa
         <div class="pf-header-identity">
           <div class="pf-avatar-wrap">
             ${u?.photoUrl
-              ? `<img src="${thumbPhotoUrl(u.photoUrl)}" class="pf-avatar">`
-              : `<div class="pf-avatar-ph">&#x1F464;</div>`}
+              ? renderModalAvatarHtml(username, u.photoUrl)
+              : renderModalAvatarHtml(username, '')}
           </div>
           <div id="pfSizeComparison" class="pf-size-icons-row"></div>
           <div class="pf-identity-text">
-            <div class="pf-username"><a href="${profileUrl}" target="_blank" class="user-link">${esc(username)}</a>${badges ? ' '+badges : ''}</div>
+            <div class="pf-username"><a href="${escAttr(profileUrl)}" target="_blank" class="user-link"${nicknameColorStyle(u)}>${esc(username)}</a>${badges ? ' '+badges : ''}</div>
             <div class="pf-usermeta">${[u?.age ? u.age+' yr' : '', u?.location].filter(Boolean).join(' \u00b7 ')}</div>
           </div>
         </div>
@@ -1824,10 +2041,10 @@ async function openProfileModal(username, profileUrl, u, userIndex, existingModa
   modal.querySelector('.modal-close').addEventListener('click', e => {
     e.preventDefault();
     e.stopPropagation();
-    modal.remove();
+    closeProfileModal(modal);
   });
-  modal.addEventListener('click', e=>{ if(e.target===modal) modal.remove(); });
-  modal.querySelector('.history-modal-btn').addEventListener('click', ()=>{ modal.remove(); openHistoryModal(username); });
+  modal.addEventListener('click', e=>{ if(e.target===modal) closeProfileModal(modal); });
+  modal.querySelector('.history-modal-btn').addEventListener('click', ()=>{ closeProfileModal(modal); openHistoryModal(username); });
 
   modal.querySelector('.pf-prev-btn').addEventListener('click', () => {
     if (userIndex > 0) { const p = filteredUsers[userIndex-1]; openProfileModal(p.username, p.profileUrl||'#', p, userIndex-1, modal); }
@@ -1847,6 +2064,7 @@ async function openProfileModal(username, profileUrl, u, userIndex, existingModa
     const parsed = { ...data, ts: Date.now() };
     if (!parsed.joinMonth && u?.joinMonth) parsed.joinMonth = u.joinMonth;
     await saveProfileSnapshot(username, parsed);
+    modal.querySelector('.pf-avatar-wrap').innerHTML = renderModalAvatarHtml(username, u?.photoUrl || '');
     renderProfileBody(username, parsed, modal.querySelector('#profileModalBody'));
   } catch(err) {
     const status = err.message.startsWith('PROFILE_STATUS:') ? err.message.slice(15) : null;
@@ -1903,10 +2121,16 @@ function photoBase(path) {
   if (s.startsWith(PHOTO_PREFIX + '/')) s = s.slice(PHOTO_PREFIX.length + 1);
   else if (s.startsWith('https://www.pinalove.com/p/')) s = s.slice('https://www.pinalove.com/p/'.length);
   else if (s.startsWith('/p/')) s = s.slice(3);
-  /* Remove size suffix: any of -browse, -big, x1, x2, x3, .jpg */
-  s = s.replace(/(-browse|-big)?(x3)?(\.jpg)$/, '');
-  /* Ensure -browse is present (canonical base ends in -browse) */
-  if (!s.endsWith('-browse')) s = s.replace(/-$/, '') + '-browse';
+  /* Remove query/hash fragments and normalize separators. */
+  s = s.split(/[?#]/)[0].replace(/^\/+|\/+$/g, '');
+  /* Remove size/media suffix variants used across endpoints. */
+  s = s
+    .replace(/-(big|browse|card|medium)(x\d+)?(\.(jpg|avif|webp))?$/i, '')
+    .replace(/x\d+(\.(jpg|avif|webp))?$/i, '')
+    .replace(/\.(jpg|avif|webp)$/i, '')
+    .replace(/-+$/, '');
+  /* Ensure -browse is present (canonical base ends in -browse). */
+  if (!s.endsWith('-browse')) s += '-browse';
   return s;
 }
 
@@ -1956,6 +2180,15 @@ async function saveProfileSnapshot(username, parsed) {
 
       /* Strip photo URLs to canonical form before storing */
       const incomingPhotos = (parsed.photos || []).map(stripPhotoUrl).filter(Boolean);
+      const fetchedAvatarId = stripPhotoUrl(parsed.avatarPhoto || parsed.avatarUrl || '');
+      const memberAvatarId = fetchedAvatarId
+        || stripPhotoUrl((allUsers.find(u => u.username === username)?.photoUrl) || '')
+        || stripPhotoUrl((profiles[username]?.currentAvatar) || '');
+      const mergedIncomingPhotos = [...new Set([memberAvatarId, ...incomingPhotos].filter(Boolean))];
+
+      /* Keep live list avatar in sync after a profile fetch. */
+      const live = allUsers.find(u => u.username === username);
+      if (live && memberAvatarId) live.photoUrl = memberAvatarId;
 
       /*
         Bootstrap entry format: migrate old snapshots-array format to new flat structure.
@@ -1970,6 +2203,8 @@ async function saveProfileSnapshot(username, parsed) {
           bio:        lastSnap?.bio    || '',
           title:      lastSnap?.title  || '',
           photos:     (old?.photos || old?.p || []).map(stripPhotoUrl).filter(Boolean),
+          currentPhotos: (old?.currentPhotos || old?.cp || old?.photos || old?.p || []).map(stripPhotoUrl).filter(Boolean),
+          currentAvatar: stripPhotoUrl(old?.currentAvatar || old?.ca || ''),
           diffs:      [],
           joinMonth:  null,
         };
@@ -2009,18 +2244,29 @@ async function saveProfileSnapshot(username, parsed) {
       }
 
       /* Track photo additions/removals as separate diffs */
-      const prevSet = new Set(entry.photos);
-      const currSet = new Set(incomingPhotos);
-      const added   = incomingPhotos.filter(p => !prevSet.has(p));
+      const prevSet = new Set(entry.currentPhotos || entry.photos || []);
+      const currSet = new Set(mergedIncomingPhotos);
+      const added   = mergedIncomingPhotos.filter(p => !prevSet.has(p));
       const removed = [...prevSet].filter(p => !currSet.has(p));
+      const prevAvatar = stripPhotoUrl(entry.currentAvatar || '');
+      const currAvatar = stripPhotoUrl(memberAvatarId || '');
+      const avatarChanged = !!(prevAvatar && currAvatar && prevAvatar !== currAvatar);
 
-      if (!isFirst && (added.length || removed.length)) {
-        entry.diffs.push({ ts: parsed.ts, photos: { added, removed } });
+      if (!isFirst && (added.length || removed.length || avatarChanged)) {
+        entry.diffs.push({
+          ts: parsed.ts,
+          photos: {
+            added,
+            removed,
+            ...(avatarChanged ? { avatarChanged: { from: prevAvatar, to: currAvatar } } : {}),
+          },
+        });
       }
 
-      /* Keep only canonical IDs for the latest fetched photo list.
-         Full URLs/stats are fetched on demand when opening the modal. */
-      entry.photos = incomingPhotos;
+      /* Keep all canonical IDs ever seen and track which ones are currently active. */
+      entry.currentPhotos = mergedIncomingPhotos;
+      entry.currentAvatar = currAvatar;
+      entry.photos = [...new Set([...(entry.photos || []), ...mergedIncomingPhotos])];
 
       // Cap diffs only — photos are kept forever
       if (entry.diffs.length > 50) entry.diffs.splice(0, entry.diffs.length - 50);
@@ -2035,7 +2281,9 @@ async function saveProfileSnapshot(username, parsed) {
           chrome.storage.local.set({ pinalove_profiles: trimmed }, () => resolve());
           return;
         }
-        profiles = all;
+        profiles[username] = all[username];
+        touchProfileCache(username);
+        renderMemoryDebugBadge();
         resolve();
       });
     });
@@ -2066,13 +2314,19 @@ function renderUserSparklineInto(username, container) {
 }
 
 function renderProfileBody(username, parsed, container) {
-  const entry = profiles[username] || { fields:{}, bio:'', title:'', photos:[], diffs:[] };
+  const entry = profiles[username] || { fields:{}, bio:'', title:'', photos:[], currentPhotos:[], currentAvatar:'', diffs:[] };
 
-  /* Prefer freshly fetched photos for rendering; fall back to stored canonical IDs. */
+  /* Render active photos first, then historical (deleted) photos. */
   const freshPhotoIds = (parsed?.photos || []).map(stripPhotoUrl).filter(Boolean);
-  const canonicalPhotos = freshPhotoIds.length ? freshPhotoIds : (entry.photos || []);
+  const memberAvatarId = stripPhotoUrl(parsed?.avatarPhoto || parsed?.avatarUrl || entry.currentAvatar || (allUsers.find(u => u.username === username)?.photoUrl) || '');
+  const activePhotos = freshPhotoIds.length
+    ? [...new Set([memberAvatarId, ...freshPhotoIds].filter(Boolean))]
+    : [...new Set((entry.currentPhotos || entry.photos || []))];
+  const activeSet = new Set(activePhotos);
+  const canonicalPhotos = [...new Set([...activePhotos, ...(entry.photos || [])])];
+  const deletedSet = new Set(canonicalPhotos.filter(p => !activeSet.has(p)));
   const allPhotos     = canonicalPhotos.map(expandPhotoUrl);
-  const allPhotosFull = canonicalPhotos.map(fullPhotoUrl);
+  const allPhotosFull = canonicalPhotos.map(p => deletedSet.has(p) ? expandPhotoUrl(p) : fullPhotoUrl(p));
 
   // Index freshly fetched stats by canonical path
   const freshStatsByPath = {};
@@ -2132,10 +2386,16 @@ function renderProfileBody(username, parsed, container) {
       const tsStr = new Date(d.ts).toLocaleDateString('en-PH', {timeZone:'Asia/Manila'}) + ' ' +
                     new Date(d.ts).toLocaleTimeString('en-PH', {timeZone:'Asia/Manila', hour:'2-digit', minute:'2-digit'});
       if (d.photos) {
-        const addedThumbs   = (d.photos.added   || []).map(p => `<img src="${thumbPhotoUrl(p)}" style="width:44px;height:49px;object-fit:cover;border-radius:3px" onerror="this.style.display='none'">`).join('');
-        const removedThumbs = (d.photos.removed || []).map(p => `<img src="${thumbPhotoUrl(p)}" style="width:44px;height:49px;object-fit:cover;border-radius:3px;opacity:.4" onerror="this.style.display='none'">`).join('');
+        const addedThumbs   = (d.photos.added   || []).map(p => `<img src="${escAttr(thumbPhotoUrl(p))}" class="clog-photo-thumb" style="width:44px;height:49px;object-fit:cover;border-radius:3px">`).join('');
+        const removedThumbs = (d.photos.removed || []).map(p => `<img src="${escAttr(thumbPhotoUrl(p))}" class="clog-photo-thumb" style="width:44px;height:49px;object-fit:cover;border-radius:3px;opacity:.4">`).join('');
+        const avatarFrom = d.photos.avatarChanged?.from || '';
+        const avatarTo = d.photos.avatarChanged?.to || '';
+        const avatarSwap = (avatarFrom && avatarTo)
+          ? `<div class="clog-photo-line" style="color:var(--gold)">avatar updated<div style="display:flex;align-items:center;gap:5px;flex-wrap:wrap;margin-top:3px"><img src="${escAttr(thumbPhotoUrl(avatarFrom))}" class="clog-photo-thumb" style="width:44px;height:49px;object-fit:cover;border-radius:3px;opacity:.45"><span style="font-size:11px;color:var(--muted2)">→</span><img src="${escAttr(thumbPhotoUrl(avatarTo))}" class="clog-photo-thumb" style="width:44px;height:49px;object-fit:cover;border-radius:3px"></div></div>`
+          : '';
         return `<div class="clog-entry">
           <div class="clog-ts">📷 ${tsStr}</div>
+          ${avatarSwap}
           ${d.photos.added?.length   ? `<div class="clog-photo-line added">+${d.photos.added.length} added<div style="display:flex;gap:3px;flex-wrap:wrap;margin-top:3px">${addedThumbs}</div></div>` : ''}
           ${d.photos.removed?.length ? `<div class="clog-photo-line removed">−${d.photos.removed.length} removed<div style="display:flex;gap:3px;flex-wrap:wrap;margin-top:3px">${removedThumbs}</div></div>` : ''}
         </div>`;
@@ -2154,14 +2414,17 @@ function renderProfileBody(username, parsed, container) {
   const photoGrid = allPhotos.length
     ? `<div class="pf-photo-grid">${allPhotos.map((url, i) => {
         const s = allStats[i];
+        const isDeleted = deletedSet.has(canonicalPhotos[i]);
         const statsHtml = s
           ? `<div class="photo-stats-overlay">
                ${s.views ? `<span class="pso pso-views" title="Views">👁 ${s.views}</span>` : ''}
                ${s.likes ? `<span class="pso pso-likes" title="Likes">♥ ${s.likes}</span>` : ''}
                ${s.favs  ? `<span class="pso pso-favs"  title="Favourited">★ ${s.favs}</span>`  : ''}
              </div>` : '';
+        const deletedBadge = isDeleted ? '<span class="photo-del-badge">deleted</span>' : '';
         return `<div class="photo-thumb-wrap" data-idx="${i}">
-          <img src="${url}" class="gallery-thumb-lg" data-idx="${i}" loading="lazy" onerror="this.parentElement&&(this.style.display='none')">
+          <img src="${escAttr(url)}" class="gallery-thumb-lg" data-idx="${i}" loading="lazy">
+          ${deletedBadge}
           ${statsHtml}
         </div>`;
       }).join('')}</div>`
@@ -2201,6 +2464,19 @@ function renderProfileBody(username, parsed, container) {
 
   container.querySelectorAll('.photo-thumb-wrap').forEach(wrap => {
     wrap.addEventListener('click', () => openLightbox(allPhotosFull, allStats, parseInt(wrap.dataset.idx)));
+  });
+
+  container.querySelectorAll('.gallery-thumb-lg').forEach(img => {
+    img.addEventListener('error', () => {
+      const wrap = img.closest('.photo-thumb-wrap');
+      if (wrap) wrap.style.display = 'none';
+    });
+  });
+
+  container.querySelectorAll('.clog-photo-thumb').forEach(img => {
+    img.addEventListener('error', () => {
+      img.style.display = 'none';
+    });
   });
 }
 
@@ -2259,7 +2535,7 @@ function openLightbox(photos, stats, startIdx) {
     <div class="lb-body">
       <button class="lb-nav lb-prev" ${photos.length<=1?'disabled':''}>‹</button>
       <div class="lb-img-area">
-        <img class="lb-img" src="${photos[idx]}">
+        <img class="lb-img" src="${escAttr(photos[idx])}">
       </div>
       <button class="lb-nav lb-next" ${photos.length<=1?'disabled':''}>›</button>
     </div>
@@ -2272,6 +2548,11 @@ function openLightbox(photos, stats, startIdx) {
   const counter  = overlay.querySelector('.lb-counter');
   const statsWrap = overlay.querySelector('.lb-stats-wrap');
 
+  function cleanupAndRemove() {
+    document.removeEventListener('keydown', onKey);
+    if (overlay.isConnected) overlay.remove();
+  }
+
   function show(i) {
     idx = (i + photos.length) % photos.length;
     img.style.opacity = '0';
@@ -2281,18 +2562,17 @@ function openLightbox(photos, stats, startIdx) {
     statsWrap.innerHTML = statsHtml(idx);
   }
 
-  overlay.querySelector('.lb-close').addEventListener('click', () => overlay.remove());
+  overlay.querySelector('.lb-close').addEventListener('click', cleanupAndRemove);
   overlay.querySelector('.lb-prev').addEventListener('click', e => { e.stopPropagation(); show(idx-1); });
   overlay.querySelector('.lb-next').addEventListener('click', e => { e.stopPropagation(); show(idx+1); });
-  overlay.addEventListener('click', e => { if (e.target === overlay) overlay.remove(); });
+  overlay.addEventListener('click', e => { if (e.target === overlay) cleanupAndRemove(); });
 
   function onKey(e) {
     if (e.key==='ArrowLeft')  show(idx-1);
     if (e.key==='ArrowRight') show(idx+1);
-    if (e.key==='Escape')     { overlay.remove(); document.removeEventListener('keydown',onKey); }
+    if (e.key==='Escape')     cleanupAndRemove();
   }
   document.addEventListener('keydown', onKey);
-  overlay.addEventListener('remove', () => document.removeEventListener('keydown', onKey));
 
   document.body.appendChild(overlay);
 }
@@ -2385,9 +2665,9 @@ function openHistoryModal(username) {
       <button class="modal-close">&#x2715;</button>
       <div class="modal-header">
         <div class="modal-user">
-          ${u.photoUrl?`<img src="${thumbPhotoUrl(u.photoUrl)}" class="modal-photo">`:'<div class="modal-photo-ph">&#x1F464;</div>'}
+          ${u.photoUrl?`<img src="${escAttr(thumbPhotoUrl(u.photoUrl))}" class="modal-photo">`:'<div class="modal-photo-ph">&#x1F464;</div>'}
           <div>
-            <div class="modal-name"><a href="${u.profileUrl||'#'}" target="_blank" class="user-link">${esc(username)}</a></div>
+            <div class="modal-name"><a href="${escAttr(u.profileUrl||'#')}" target="_blank" class="user-link"${nicknameColorStyle(u)}>${esc(username)}</a></div>
             <div class="modal-meta">${[u.age,u.location].filter(Boolean).join(' · ')} · ${fmtMinutes(total)} in 30d</div>
           </div>
         </div>
@@ -2455,6 +2735,10 @@ function esc(s) {
   return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
 
+function escAttr(s) {
+  return esc(s).replace(/'/g, '&#39;');
+}
+
 /*
   =====================================================
   EVENT BINDING & UI INTERACTIVITY
@@ -2478,6 +2762,23 @@ function esc(s) {
     - Storage change listener (syncs when background scan completes)
 */
 function bindEvents() {
+  const logo = $('pinkertonLogo');
+  if (logo) {
+    logo.addEventListener('click', () => {
+      logoDebugTapCount++;
+      clearTimeout(logoDebugTapTimer);
+      logoDebugTapTimer = setTimeout(() => { logoDebugTapCount = 0; }, 1800);
+
+      if (logoDebugTapCount >= 5) {
+        logoDebugTapCount = 0;
+        clearTimeout(logoDebugTapTimer);
+        debugHistoryEnabled = !debugHistoryEnabled;
+        renderHistoryDebugBadge();
+        renderMemoryDebugBadge();
+      }
+    });
+  }
+
   /* Type filter pills: toggle flags when clicked, re-render immediately */
   document.querySelectorAll('[data-filter]').forEach(pill => {
     pill.addEventListener('click', () => {
@@ -2592,21 +2893,40 @@ function bindEvents() {
     if (area !== 'local') return;
     let needRebuild = false;
 
-    if (changes.pinalove_history)  { history  = changes.pinalove_history.newValue  || {}; needRebuild = true; renderHistoryDebugBadge(); }
-    if (changes.pinalove_profiles) { profiles = decodeProfilesMap(changes.pinalove_profiles.newValue || {}); }
+    if (changes.pinalove_history)  { history  = changes.pinalove_history.newValue  || {}; needRebuild = true; renderHistoryDebugBadge(); renderMemoryDebugBadge(); }
+    if (changes.pinalove_profiles) {
+      profiles = {};
+      profileCacheOrder = [];
+      profileAvatarOverrides = extractProfileAvatarMap(changes.pinalove_profiles.newValue || {});
+      needRebuild = true;
+      renderMemoryDebugBadge();
+    }
     if (changes.pinalove_settings) {
       const s = changes.pinalove_settings.newValue;
       if (s?.scanInterval) { scanInterval = s.scanInterval; renderHeaderSparkline(); }
     }
     if (changes.pinalove_totals) {
       totals = changes.pinalove_totals.newValue || [];
+      renderMemoryDebugBadge();
       renderHeaderSparkline();
     }
 
     /* pinalove_members is the primary data source — rebuild when it changes. */
-    if (changes.pinalove_members || changes.pinalove_member_locations || changes.pinalove_visited) {
+    if (changes.pinalove_members || changes.pinalove_member_locations || changes.pinalove_visited || changes.pinalove_profiles) {
       chrome.storage.local.get(['pinalove_members', 'pinalove_member_locations', 'pinalove_visited'], d => {
+        if (changes.pinalove_members) {
+          const incomingMembers = d.pinalove_members || {};
+          const incomingLocations = d.pinalove_member_locations || [];
+          const newlyAdded = new Set();
+          for (const username of Object.keys(incomingMembers)) {
+            if (knownUsernames.has(username)) continue;
+            const parsed = decodeMemberEntry(username, incomingMembers[username], incomingLocations);
+            if (parsed.isNew) newlyAdded.add(username);
+          }
+          refreshNewUsers = newlyAdded;
+        }
         buildAllUsers(d.pinalove_members || {}, d.pinalove_member_locations || [], d.pinalove_visited || {});
+        knownUsernames = new Set(allUsers.map(u => u.username));
         populateLocations();
         applyAndRender();
         renderHeaderSparkline();

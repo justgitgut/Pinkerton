@@ -42,7 +42,7 @@
       background: linear-gradient(90deg, rgba(255,45,155,.05), rgba(0,229,255,.05));
       pointer-events: none;
     }
-    .logo { font-family: var(--disp); font-size: 16px; font-weight: 800; letter-spacing: -.5px; white-space: nowrap; flex-shrink: 0; position: relative; }
+    .logo { font-family: var(--disp); font-size: 16px; font-weight: 800; letter-spacing: -.5px; white-space: nowrap; flex-shrink: 0; position: relative; cursor: pointer; }
     .logo-pin    { color: var(--magenta); text-shadow: 0 0 12px rgba(255,45,155,.6); }
     .logo-kerton { color: var(--cyan);    text-shadow: 0 0 12px rgba(0,229,255,.35); }
     .logo-ver    { font-size: 9px; color: var(--muted2); font-family: var(--mono); font-weight: 400; letter-spacing: 1px; margin-left: 4px; vertical-align: middle; }
@@ -63,6 +63,26 @@
     .hstat.mag      .hstat-val { color: var(--magenta); }  .hstat.mag::after      { background: var(--magenta); }
     .hstat.gold     .hstat-val { color: var(--gold); }     .hstat.gold::after     { background: var(--gold); }
     .hstat.lavender .hstat-val { color: var(--lavender); } .hstat.lavender::after { background: var(--lavender); }
+    .hstat.small { padding: 2px 6px; min-width: 34px; }
+    .hstat.small .hstat-val { font-size: 13px; }
+    .hstat.small .hstat-lbl { font-size: 7px; letter-spacing: .8px; }
+    .hstat-group {
+      display: flex;
+      flex-direction: row;
+      align-items: center;
+      gap: 6px;
+      flex-shrink: 0;
+    }
+    .hstat-group-label {
+      font-size: 9px;
+      letter-spacing: 1px;
+      text-transform: uppercase;
+      color: var(--muted2);
+      font-weight: 700;
+      text-align: left;
+      line-height: 1.05;
+      white-space: nowrap;
+    }
 
     /* Activity sparkline widget */
     .header-spark-wrap {
@@ -122,9 +142,21 @@
     .pill[data-filter="new"]      { color: var(--gold);     border-color: rgba(255,209,102,.25); }
     .pill[data-filter="premium"]  { color: var(--magenta);  border-color: rgba(255,45,155,.25); }
     .pill[data-filter="verified"] { color: var(--lavender); border-color: rgba(179,136,255,.22); }
-    .pill[data-filter="new"].active      { background: rgba(255,209,102,.14); border-color: var(--gold); }
-    .pill[data-filter="premium"].active  { background: rgba(255,45,155,.12);  border-color: var(--magenta); }
-    .pill[data-filter="verified"].active { background: rgba(179,136,255,.14); border-color: var(--lavender); }
+    .pill[data-filter="new"].active {
+      background: var(--gold);
+      border-color: var(--gold);
+      color: #171a1f;
+    }
+    .pill[data-filter="premium"].active {
+      background: var(--magenta);
+      border-color: var(--magenta);
+      color: #ffffff;
+    }
+    .pill[data-filter="verified"].active {
+      background: var(--lavender);
+      border-color: var(--lavender);
+      color: #161826;
+    }
     .pill:hover:not(.active) { opacity: .75; }
 
     .age-inputs { display: flex; align-items: center; gap: 6px; }
@@ -143,6 +175,37 @@
     }
     .sort-select:focus { outline: none; border-color: var(--cyan); }
     .sidebar-footer { padding-top: 12px; border-top: 1px solid var(--border); }
+    .sidebar-debug-panel {
+      display: none;
+      margin-top: 10px;
+      gap: 8px;
+    }
+    .debug-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-family: var(--mono);
+      font-size: 9px;
+      line-height: 1.25;
+      table-layout: fixed;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      overflow: hidden;
+      background: var(--bg);
+    }
+    .debug-table td {
+      border-bottom: 1px solid var(--border);
+      padding: 3px 5px;
+      color: var(--muted2);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .debug-table tr:last-child td { border-bottom: none; }
+    .debug-table td:first-child {
+      width: 42%;
+      color: var(--text);
+      background: rgba(255,255,255,0.02);
+    }
 
     /* ── Main content ── */
     .main {
@@ -169,11 +232,20 @@
       transform: translateY(-2px);
       box-shadow: 0 8px 28px rgba(0,0,0,.5), 0 0 0 1px rgba(0,229,255,.1);
     }
+    .user-card.newly-added {
+      border-color: rgba(255, 209, 102, 0.9);
+      box-shadow: 0 0 0 1px rgba(255, 209, 102, 0.35), 0 10px 26px rgba(0,0,0,.46);
+    }
+    .user-card.newly-added:hover {
+      border-color: rgba(255, 209, 102, 1);
+      box-shadow: 0 0 0 1px rgba(255, 209, 102, 0.55), 0 12px 30px rgba(0,0,0,.52);
+    }
 
     .card-photo-wrap {
       display: block; position: relative; width: 100%; aspect-ratio: 133/146;
       background: var(--surf2); overflow: hidden; flex-shrink: 0; cursor: pointer;
     }
+    .card-photo-wrap.newly-added { box-shadow: inset 0 0 0 2px rgba(255, 209, 102, 0.75); }
     .card-photo-wrap img { width: 100%; height: 100%; object-fit: cover; display: block; transition: transform .3s; }
     .user-card:hover .card-photo-wrap img { transform: scale(1.04); }
     .card-photo-placeholder {
@@ -232,6 +304,14 @@
     .user-table td { padding: 7px 10px; border-bottom: 1px solid rgba(37,37,56,.8); font-size: 12px; vertical-align: middle; }
     .user-table tr:last-child td { border-bottom: none; }
     .user-table tr:hover td { background: rgba(0,229,255,.02); }
+    .table-thumb-wrap.newly-added {
+      border: 1px solid rgba(255, 209, 102, 0.9);
+      border-radius: 5px;
+      box-shadow: 0 0 0 1px rgba(255, 209, 102, 0.3);
+      overflow: hidden;
+      display: inline-block;
+      line-height: 0;
+    }
     .user-link { color: var(--cyan); text-decoration: none; cursor: pointer; }
     .user-link:hover { text-decoration: underline; color: var(--magenta); }
     .badge {
@@ -263,6 +343,19 @@
         border-radius: 999px;
         color: #ff8dc8;
         background: rgba(255, 45, 155, 0.08);
+        font-family: "DM Mono", monospace;
+        font-size: 10px;
+        letter-spacing: 0.02em;
+        white-space: nowrap;
+      }
+      .memory-debug-badge {
+        display: none;
+        align-items: center;
+        padding: 6px 10px;
+        border: 1px solid rgba(0, 229, 255, 0.35);
+        border-radius: 999px;
+        color: #8fefff;
+        background: rgba(0, 229, 255, 0.09);
         font-family: "DM Mono", monospace;
         font-size: 10px;
         letter-spacing: 0.02em;
@@ -491,6 +584,22 @@
     .pf-photo-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 8px; }
     .photo-thumb-wrap { position: relative; cursor: pointer; overflow: hidden; border-radius: 4px; }
     .photo-thumb-wrap .gallery-thumb-lg { display: block; width: 100%; }
+    .photo-del-badge {
+      position: absolute;
+      top: 6px;
+      right: 6px;
+      padding: 2px 7px;
+      border-radius: 999px;
+      font-size: 10px;
+      font-weight: 700;
+      letter-spacing: 0.03em;
+      text-transform: uppercase;
+      color: #fff;
+      background: rgba(197, 48, 48, 0.92);
+      border: 1px solid rgba(255, 255, 255, 0.35);
+      text-shadow: 0 1px 2px rgba(0, 0, 0, 0.35);
+      pointer-events: none;
+    }
     .photo-stats-overlay {
       position: absolute; bottom: 0; left: 0; right: 0;
       display: flex; gap: 6px; padding: 5px 7px;
@@ -541,7 +650,7 @@
 
   <!-- Top bar -->
   <div class="topbar">
-    <div class="logo"><span class="logo-pin">Pin</span><span class="logo-kerton">kerton</span><span class="logo-ver">v3.5</span></div>
+    <div class="logo" id="pinkertonLogo" title="Pinkerton"><span class="logo-pin">Pin</span><span class="logo-kerton">kerton</span><span class="logo-ver">v3.5</span></div>
     <div class="topbar-divider"></div>
 
     <div class="header-stats">
@@ -549,6 +658,17 @@
       <div class="hstat gold">   <div class="hstat-val" id="hNew">0</div>     <div class="hstat-lbl">New</div>     </div>
       <div class="hstat mag">     <div class="hstat-val" id="hPremium">0</div> <div class="hstat-lbl">Premium</div> </div>
       <div class="hstat lavender"><div class="hstat-val" id="hVerified">0</div><div class="hstat-lbl">Verified</div></div>
+    </div>
+    <div class="topbar-divider"></div>
+
+    <div class="hstat-group" title="Unique users seen in scans during the last 24 hours">
+      <div class="hstat-group-label">Last<br>24h</div>
+      <div class="header-stats">
+        <div class="hstat small cyan">   <div class="hstat-val" id="h24Online">0</div>   <div class="hstat-lbl">Online</div>  </div>
+        <div class="hstat small gold">   <div class="hstat-val" id="h24New">0</div>     <div class="hstat-lbl">New</div>     </div>
+        <div class="hstat small mag">     <div class="hstat-val" id="h24Premium">0</div> <div class="hstat-lbl">Prem</div> </div>
+        <div class="hstat small lavender"><div class="hstat-val" id="h24Verified">0</div><div class="hstat-lbl">Ver</div></div>
+      </div>
     </div>
     <div class="topbar-divider"></div>
 
@@ -570,7 +690,6 @@
       <button class="vbtn active" id="gridViewBtn">⊞</button>
       <button class="vbtn" id="tableViewBtn">☰</button>
     </div>
-      <span id="historyDebugBadge" class="history-debug-badge"></span>
     <button class="btn btn-ghost" id="refreshBtn">↻</button>
   </div>
 
@@ -629,6 +748,10 @@
       </div>
       <div class="sidebar-footer">
         <button class="btn btn-ghost" id="resetFilters" style="width:100%">Reset Filters</button>
+        <div id="sidebarDebugPanel" class="sidebar-debug-panel">
+          <table id="historyDebugBadge" class="debug-table"></table>
+          <table id="memoryDebugBadge" class="debug-table"></table>
+        </div>
       </div>
     </aside>
 
