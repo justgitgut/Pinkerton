@@ -98,7 +98,7 @@
     .result-count strong { color: var(--text); }
     .topbar-spacer { flex: 1; min-width: 8px; }
 
-    .search-wrap { width: 210px; flex-shrink: 0; position: relative; }
+    .search-wrap { width: 100%; position: relative; }
     .search-wrap input {
       width: 100%; background: var(--surf); border: 1px solid var(--border);
       border-radius: 6px; padding: 6px 10px 6px 28px; color: var(--text);
@@ -680,12 +680,6 @@
 
     <div class="result-count" id="resultCount"><strong>0</strong> users</div>
     <div class="topbar-spacer"></div>
-
-    <div class="search-wrap">
-      <span class="search-icon">⌕</span>
-      <input type="text" id="searchInput" placeholder="Search username…">
-      <span class="search-clear" id="searchClear">&#x2715;</span>
-    </div>
     <div class="view-toggle">
       <button class="vbtn active" id="gridViewBtn">⊞</button>
       <button class="vbtn" id="tableViewBtn">☰</button>
@@ -701,6 +695,14 @@
 
   <div class="layout">
     <aside class="sidebar">
+      <div class="filter-section">
+        <div class="filter-heading">Search</div>
+        <div class="search-wrap">
+          <span class="search-icon">⌕</span>
+          <input type="text" id="searchInput" placeholder="Search username…">
+          <span class="search-clear" id="searchClear">&#x2715;</span>
+        </div>
+      </div>
       <div class="filter-section">
         <div class="filter-heading">Member Type</div>
         <div class="pill-group">
