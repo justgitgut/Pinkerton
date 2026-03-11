@@ -80,6 +80,11 @@
     @keyframes pulse-slide{0%{left:-40%}100%{left:110%}}
     .progress-text{font-size:10px;color:var(--muted2);text-align:center}
 
+    .purge-wrap{display:none;margin:2px 0}
+    .purge-bar-bg{height:2px;background:var(--border);border-radius:2px;overflow:hidden;margin-bottom:4px}
+    .purge-bar-fill{height:100%;border-radius:2px;background:linear-gradient(90deg,var(--gold),var(--coral));transition:width .3s ease}
+    .purge-text{font-size:10px;color:var(--muted2);text-align:center}
+
     .status{font-size:11px;min-height:16px;text-align:center}
     .status.ok{color:var(--teal)}.status.err{color:var(--coral)}.status.info{color:var(--muted2)}
 
@@ -215,6 +220,10 @@
     <div class="progress-wrap" id="progressWrap">
       <div class="progress-pulse"></div>
       <div class="progress-text" id="progressText"></div>
+    </div>
+    <div class="purge-wrap" id="purgeWrap">
+      <div class="purge-bar-bg"><div class="purge-bar-fill" id="purgeBarFill" style="width:0%"></div></div>
+      <div class="purge-text" id="purgeText"></div>
     </div>
     <div class="countdown" id="countdown" style="display:none">Next scan in <span id="countdownVal">—</span></div>
 

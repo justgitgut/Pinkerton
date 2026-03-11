@@ -136,9 +136,14 @@ const WATCHDOG_MS    = 30000; /* 30 seconds without a progress update = frozen *
    */
   chrome.storage.local.get('pinalove_scan_progress', data => {
     const prog = data.pinalove_scan_progress;
-    if (prog && prog.ts && prog.ts > Date.now() - 60000 && prog.type === 'progress') {
-      setScanningState(true);
-      updateProgress(prog);
+    if (prog && prog.ts && prog.ts > Date.now() - 60000) {
+      if (prog.type === 'progress') {
+        setScanningState(true);
+        updateProgress(prog);
+      } else if (prog.type === 'purge' && !prog.done) {
+        /* Purge was mid-flight when popup opened — restore the bar. */
+        updateProgress(prog);
+      }
     }
   });
 
@@ -585,8 +590,36 @@ function updateProgress(prog) {
     }
 
   } else if (prog.type === 'info') {
-    /* Informational events (e.g. storage purge start/complete) are shown briefly. */
+    /* Informational events shown briefly in the status bar. */
     setStatus('ℹ ' + prog.message, 'info');
+
+  } else if (prog.type === 'purge') {
+    /* Storage-pressure purge running in the background, independent of the scan. */
+    const purgeWrap    = $('purgeWrap');
+    const purgeBarFill = $('purgeBarFill');
+    const purgeText    = $('purgeText');
+    const startPct  = Number(prog.startPct ?? prog.storagePct ?? 100);
+    const targetPct = Number(prog.targetPct ?? 80);
+    const currentPct = Number(prog.storagePct ?? startPct);
+
+    /* Progress is based on storage recovery, not number of users evicted.
+       0% = still at startPct, 100% = reached targetPct or lower. */
+    const span = Math.max(1, startPct - targetPct);
+    const recovered = Math.max(0, Math.min(span, startPct - currentPct));
+    const progressPct = Math.max(0, Math.min(100, Math.round((recovered / span) * 100)));
+
+    if (prog.done) {
+      if (purgeWrap) purgeWrap.style.display = 'none';
+      const noun = prog.purged === 1 ? 'member' : 'members';
+      setStatus(`ℹ Purged ${prog.purged} ${noun} — storage now at ${currentPct}%`, 'info');
+      renderStorage(); // refresh the storage usage bar with the freed space
+    } else {
+      if (purgeWrap) purgeWrap.style.display = 'block';
+      if (purgeBarFill) purgeBarFill.style.width = progressPct + '%';
+      const msg = `Purging storage: ${currentPct}% -> ${targetPct}% target (${progressPct}%)`;
+      if (purgeText) purgeText.textContent = msg;
+      setStatus(`Storage at ${currentPct}% — freeing space toward ${targetPct}%…`, 'info');
+    }
 
   } else if (prog.type === 'error') {
     setStatus('⚠ ' + prog.message, 'err');
@@ -872,12 +905,23 @@ function bindEvents() {
   chrome.storage.onChanged.addListener((changes, area) => {
     if (area !== 'local') return;
 
-    /* Progress updates — scan page counter and status bar. */
+    /* Progress updates — scan page counter and status bar.
+       Deduplication (lastProgressTs) only applies to 'progress' type events, which can
+       fire rapidly one-per-page-fetch. Terminal events ('done', 'error') and informational
+       ones ('info') must always be processed — they can share the same millisecond timestamp
+       as the preceding 'progress' event and would otherwise be silently dropped, leaving the
+       watchdog armed and eventually triggering a false "Scan timed out" warning. */
     if (changes.pinalove_scan_progress) {
       const prog = changes.pinalove_scan_progress.newValue;
-      if (prog?.ts && prog.ts > lastProgressTs && prog.ts > Date.now() - 60000) {
-        lastProgressTs = prog.ts;
-        updateProgress(prog);
+      if (prog?.ts && prog.ts > Date.now() - 60000) {
+        if (prog.type === 'progress') {
+          if (prog.ts > lastProgressTs) {
+            lastProgressTs = prog.ts;
+            updateProgress(prog);
+          }
+        } else {
+          updateProgress(prog);
+        }
       }
     }
 

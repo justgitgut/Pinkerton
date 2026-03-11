@@ -34,6 +34,7 @@ const HISTORY_PACK_PREFIX = 'p1:';
 const MEMBER_FLAG_NEW = 1;
 const MEMBER_FLAG_PREMIUM = 2;
 const MEMBER_FLAG_VERIFIED = 4;
+const MEMBER_FLAG_BIRTHDAY = 8;
 
 /* Scan diff bitmask for compact changelog entries [ts, mask]. */
 const MEMBER_DIFF_PREMIUM = 1;
@@ -42,6 +43,7 @@ const MEMBER_DIFF_VERIFIED = 4;
 const MEMBER_DIFF_AGE = 8;
 const MEMBER_DIFF_LOCATION = 16;
 const MEMBER_DIFF_PHOTO = 32;
+const MEMBER_DIFF_BIRTHDAY = 64;
 const MEMBER_LOG_MAX = 10;
 const NEW_FLAG_DEFAULT_DAYS = 2;
 const NEW_FLAG_MIN_DAYS = 1;
@@ -114,11 +116,12 @@ function canonicalPhotoId(uri) {
   return path.replace(/\/+$/, '');
 }
 
-function memberFlags(isNew, isPremium, isVerified) {
+function memberFlags(isNew, isPremium, isVerified, isBirthday = false) {
   let f = 0;
   if (isNew) f |= MEMBER_FLAG_NEW;
   if (isPremium) f |= MEMBER_FLAG_PREMIUM;
   if (isVerified) f |= MEMBER_FLAG_VERIFIED;
+  if (isBirthday) f |= MEMBER_FLAG_BIRTHDAY;
   return f;
 }
 
@@ -148,6 +151,7 @@ function normalizeMemberLog(rawLog = null) {
       if (changes.isPremium)  mask |= MEMBER_DIFF_PREMIUM;
       if (changes.isNew)      mask |= MEMBER_DIFF_NEW;
       if (changes.isVerified) mask |= MEMBER_DIFF_VERIFIED;
+      if (changes.isBirthday) mask |= MEMBER_DIFF_BIRTHDAY;
       if (changes.age)        mask |= MEMBER_DIFF_AGE;
       if (changes.location)   mask |= MEMBER_DIFF_LOCATION;
       if (changes.photoUrl)   mask |= MEMBER_DIFF_PHOTO;
@@ -170,6 +174,11 @@ function joinMonthToTs(joinMonth) {
   return Date.UTC(y, m - 1, 1);
 }
 
+function phDayFromTs(ts) {
+  const d = new Date((Number(ts) || 0) + 8 * 3600000);
+  return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`;
+}
+
 function compactMemberEntry(raw, username, locations, locationToIndex) {
   const src = raw && typeof raw === 'object' ? raw : {};
   const isCompact = ('sc' in src) || ('ls' in src) || ('f' in src) || ('l' in src);
@@ -189,8 +198,9 @@ function compactMemberEntry(raw, username, locations, locationToIndex) {
       a: src.a ?? src.age ?? null,
       l: (typeof locIdx === 'number') ? locIdx : null,
       p: src.p || canonicalPhotoId(src.photoUrl) || '',
-      f: Number.isInteger(src.f) ? src.f : memberFlags(src.isNew, src.isPremium, src.isVerified),
+      f: Number.isInteger(src.f) ? src.f : memberFlags(src.isNew, src.isPremium, src.isVerified, src.isBirthday),
       j: joinMonth,
+      bd: src.bd ?? src.birthdayDate ?? null,
       ls: src.ls ?? src.lastSeen ?? src.sc ?? src.lastScanned ?? 0,
       fs: src.fs ?? src.firstSeen ?? src.sc ?? src.lastScanned ?? 0,
       r: registeredAt,
@@ -212,8 +222,9 @@ function compactMemberEntry(raw, username, locations, locationToIndex) {
     a: src.age ?? null,
     l: ensureLocationIndex(src.location || '', locations, locationToIndex),
     p: canonicalPhotoId(src.photoUrl) || '',
-    f: memberFlags(!!src.isNew, !!src.isPremium, !!src.isVerified),
+    f: memberFlags(!!src.isNew, !!src.isPremium, !!src.isVerified, !!src.isBirthday),
     j: joinMonth,
+    bd: src.birthdayDate ?? null,
     ls: src.lastSeen ?? src.lastScanned ?? 0,
     fs: src.firstSeen ?? src.lastScanned ?? 0,
     r: registeredAt,
@@ -699,8 +710,12 @@ async function updateHistory(scanTs, onlineUsernames) {
       }
 
       chrome.storage.local.set({ pinalove_history: history }, () => {
-        /* After saving, check if we are approaching the storage quota. */
-        runStoragePurgeIfNeeded().then(resolve);
+        /* After saving, check storage pressure.
+           Fire-and-forget — the purge runs independently of the scan loop so
+           scanUntilOffline() can complete and reschedule the alarm immediately
+           rather than waiting for potentially many async storage round-trips. */
+        runStoragePurgeIfNeeded();
+        resolve();
       });
     });
   });
@@ -727,57 +742,111 @@ const PURGE_LOW     = 0.80;             // stop purging below this fraction
  *
  * @returns {Promise<void>}
  */
+let _purgeRunning = false;
+
 async function runStoragePurgeIfNeeded() {
+  if (_purgeRunning) return; // already in progress — skip
+  _purgeRunning = true;
   return new Promise(resolve => {
     chrome.storage.local.getBytesInUse(null, bytesUsed => {
       const ratio = bytesUsed / STORAGE_QUOTA;
-      if (ratio < PURGE_HIGH) return resolve(); // within limits — nothing to do
+      if (ratio < PURGE_HIGH) { _purgeRunning = false; return resolve(); } // within limits — nothing to do
 
       console.log(`[Pinkerton] Storage at ${(ratio*100).toFixed(1)}% — purging least active users`);
-      setProgress({ type: 'info', message: `Storage at ${(ratio*100).toFixed(0)}% — purging old history…` });
 
-      chrome.storage.local.get('pinalove_history', data => {
-        const history = data.pinalove_history || {};
+      chrome.storage.local.get(['pinalove_history', 'pinalove_profiles', 'pinalove_members'], data => {
+        const history  = data.pinalove_history  || {};
+        const profiles = data.pinalove_profiles || {};
+        const members  = data.pinalove_members  || {};
 
-        /* Score each user by total minutes across all retained days.
-           Higher score = more activity = keep longer. */
-        const scores = Object.entries(history).map(([username, entry]) => {
-          const total = Object.entries(entry)
-            .reduce((sum, [, buckets]) => sum + sumDayBucketMinutes(buckets), 0);
-          return { username, total };
+        /* ── Tier 1: wipe all history in one shot ─────────────────────────
+           Individual history entries are tiny (proven by the 1458-entries-still-97%
+           case). Clearing the entire object in one write avoids thousands of
+           round-trips and immediately reclaims whatever space history holds. */
+        const hadHistory = Object.keys(history).length > 0;
+        for (const u of Object.keys(history)) delete history[u];
+
+        /* ── Tier 2: full member eviction ──────────────────────────────────
+           Sort all known members by lastSeen ascending (oldest / least recently
+           active first). Each batch removes entries from members AND profiles so
+           the combined write actually reclaims meaningful storage. */
+        const memberList = Object.keys(members)
+          .map(username => ({ username, ls: Number(members[username]?.ls ?? members[username]?.sc ?? 0) || 0 }))
+          .sort((a, b) => a.ls - b.ls);
+
+        const totalCandidates = memberList.length;
+        const startPct = Math.round(ratio * 100);
+        const targetPct = Math.round(PURGE_LOW * 100);
+        let evictedCount = 0;
+        const BATCH_SIZE = 500; // members per write — faster large-scale space recovery
+
+        setProgress({
+          type: 'purge',
+          purged: 0,
+          total: totalCandidates,
+          storagePct: startPct,
+          startPct,
+          targetPct,
         });
 
-        /* Sort ascending — least-active users are evicted first. */
-        scores.sort((a, b) => a.total - b.total);
+        function emitDone(bytes) {
+          const r = bytes / STORAGE_QUOTA;
+          console.log(`[Pinkerton] Purge done: ${evictedCount} members removed, storage at ${(r*100).toFixed(1)}%`);
+          setProgress({
+            type: 'purge',
+            purged: evictedCount,
+            total: totalCandidates,
+            storagePct: Math.round(r * 100),
+            startPct,
+            targetPct,
+            done: true,
+          });
+          _purgeRunning = false;
+          resolve();
+        }
 
-        let i = 0;
-
-        /* Recursively evict one user at a time, re-checking storage after each deletion. */
-        function purgeNext() {
-          if (i >= scores.length) {
-            return chrome.storage.local.set({ pinalove_history: history }, resolve);
+        /* Evict one batch of members, persist, check usage, repeat. */
+        function evictBatch() {
+          if (evictedCount >= totalCandidates) {
+            chrome.storage.local.getBytesInUse(null, emitDone);
+            return;
           }
 
-          /* Wipe all day buckets for this user. */
-          const entry = history[scores[i].username];
-          for (const k of Object.keys(entry)) delete entry[k];
-          i++;
+          const batch = memberList.slice(evictedCount, evictedCount + BATCH_SIZE);
+          for (const { username } of batch) {
+            delete members[username];
+            delete profiles[username];
+          }
+          evictedCount += batch.length;
 
-          chrome.storage.local.getBytesInUse(null, bytes => {
-            const r = bytes / STORAGE_QUOTA;
-            console.log(`[Pinkerton] After purging ${i} users: ${(r*100).toFixed(1)}%`);
-
-            if (r < PURGE_LOW) {
-              /* We have freed enough space — save and notify popup. */
-              setProgress({ type: 'info', message: `Purged ${i} user histories — storage now at ${(r*100).toFixed(0)}%` });
-              chrome.storage.local.set({ pinalove_history: history }, resolve);
-            } else {
-              purgeNext(); // still too high — evict the next user
-            }
+          chrome.storage.local.set({ pinalove_members: members, pinalove_profiles: profiles }, () => {
+            chrome.storage.local.getBytesInUse(null, bytes => {
+              const r = bytes / STORAGE_QUOTA;
+              console.log(`[Pinkerton] After evicting ${evictedCount} members: ${(r*100).toFixed(1)}%`);
+              if (r < PURGE_LOW) return emitDone(bytes);
+              setProgress({
+                type: 'purge',
+                purged: evictedCount,
+                total: totalCandidates,
+                storagePct: Math.round(r * 100),
+                startPct,
+                targetPct,
+              });
+              evictBatch();
+            });
           });
         }
 
-        purgeNext();
+        /* Always flush history first (even if already empty, ensures clean state).
+           After clearing history, re-check — if that alone freed enough, stop early. */
+        chrome.storage.local.set({ pinalove_history: history }, () => {
+          if (!hadHistory) return evictBatch();
+          chrome.storage.local.getBytesInUse(null, bytes => {
+            const r = bytes / STORAGE_QUOTA;
+            if (r < PURGE_LOW) return emitDone(bytes);
+            evictBatch();
+          });
+        });
       });
     });
   });
@@ -913,6 +982,7 @@ function thumbToUser(t) {
   const isPremium  = !!t.ispop;
   const isNew      = !!t.newmember;
   const isVerified = t.faceverified === 1;
+  const isBirthday = Number(t.birthday || 0) === 1;
   const age        = t.age ? parseInt(t.age, 10) : null;
   const location   = normalizeCity(t.city || '');
   const profileUrl = username ? `${BASE}/${username}` : null;
@@ -943,7 +1013,7 @@ function thumbToUser(t) {
     }
   }
 
-  return { username, profileUrl, photoUrl, isOnline, isPremium, isNew, isVerified, age, location, joinMonth, lastSeen };
+  return { username, profileUrl, photoUrl, isOnline, isPremium, isNew, isVerified, isBirthday, age, location, joinMonth, lastSeen };
 }
 
 /* ─── Browse URL builder ─────────────────────────────────────────────────────── */
@@ -1301,9 +1371,11 @@ async function storeFailedScan(ts, reason) {
  */
 async function mergeMembersFromScan(scanTs, users) {
   return new Promise(resolve => {
-    chrome.storage.local.get(['pinalove_members', 'pinalove_member_locations', 'pinalove_settings'], data => {
+    chrome.storage.local.get(['pinalove_members', 'pinalove_member_locations', 'pinalove_settings', 'pinalove_profiles', 'pinalove_history'], data => {
       const members = data.pinalove_members || {};
       let locations = Array.isArray(data.pinalove_member_locations) ? [...data.pinalove_member_locations] : [];
+      const profiles = data.pinalove_profiles || {};
+      const history = data.pinalove_history || {};
       const locationToIndex = new Map(locations.map((v, i) => [v, i]));
       const cutoff  = Date.now() - 30 * 86400000; // 30-day retention window
       const cfgDaysRaw = parseInt(data.pinalove_settings?.clearNewAfterDays, 10);
@@ -1322,25 +1394,32 @@ async function mergeMembersFromScan(scanTs, users) {
 
         const existing = members[u.username];
         const locIdx = ensureLocationIndex(u.location || '', locations, locationToIndex);
-        const newFlags = memberFlags(!!u.isNew, !!u.isPremium, !!u.isVerified);
+        const newFlags = memberFlags(!!u.isNew, !!u.isPremium, !!u.isVerified, !!u.isBirthday);
         const newPhoto = canonicalPhotoId(u.photoUrl) || '';
         const newAge = (u.age == null ? null : u.age);
         const newLastSeen = u.lastSeen ?? scanTs;
         const newJoinMonth = u.joinMonth || null;
+        const newBirthdayDate = !!u.isBirthday ? phDayFromTs(scanTs) : null;
         const estimatedJoinTs = joinMonthToTs(newJoinMonth);
 
         if (!existing) {
-          /* New user — insert compact record. */
+          /* New user — insert compact record.
+             If the site marks this user as a new member (newmember:1) they registered
+             very recently, so use the scan timestamp as the precise insertion date (ri=0).
+             For existing long-time members first appearing in a scan, prefer the avatar-
+             derived join-month estimate when available (ri=1), falling back to scanTs. */
+          const isNewMember = !!u.isNew;
           members[u.username] = {
             a: newAge,
             l: (typeof locIdx === 'number') ? locIdx : null,
             p: newPhoto,
             f: newFlags,
             j: newJoinMonth,
+            bd: newBirthdayDate,
             ls: newLastSeen,
             fs: scanTs,
-            r: estimatedJoinTs || scanTs,
-            ri: estimatedJoinTs ? 1 : 0,
+            r: isNewMember ? scanTs : (estimatedJoinTs || scanTs),
+            ri: isNewMember ? 0 : (estimatedJoinTs ? 1 : 0),
             sc: scanTs,
             g: [],
           };
@@ -1351,6 +1430,7 @@ async function mergeMembersFromScan(scanTs, users) {
           if ((prevFlags & MEMBER_FLAG_PREMIUM) !== (newFlags & MEMBER_FLAG_PREMIUM)) mask |= MEMBER_DIFF_PREMIUM;
           if ((prevFlags & MEMBER_FLAG_NEW) !== (newFlags & MEMBER_FLAG_NEW)) mask |= MEMBER_DIFF_NEW;
           if ((prevFlags & MEMBER_FLAG_VERIFIED) !== (newFlags & MEMBER_FLAG_VERIFIED)) mask |= MEMBER_DIFF_VERIFIED;
+          if ((prevFlags & MEMBER_FLAG_BIRTHDAY) !== (newFlags & MEMBER_FLAG_BIRTHDAY)) mask |= MEMBER_DIFF_BIRTHDAY;
           if ((existing.a ?? null) !== newAge) mask |= MEMBER_DIFF_AGE;
           if ((existing.l ?? null) !== ((typeof locIdx === 'number') ? locIdx : null)) mask |= MEMBER_DIFF_LOCATION;
           if ((existing.p || '') !== newPhoto) mask |= MEMBER_DIFF_PHOTO;
@@ -1369,6 +1449,7 @@ async function mergeMembersFromScan(scanTs, users) {
           existing.p = newPhoto;
           existing.l = (typeof locIdx === 'number') ? locIdx : null;
           if (newJoinMonth && (!existing.j || newJoinMonth < existing.j)) existing.j = newJoinMonth;
+          if (newBirthdayDate) existing.bd = newBirthdayDate;
           if (!existing.fs) existing.fs = scanTs;
           if (!Number(existing.r || 0)) {
             const fallbackEstimatedTs = joinMonthToTs(existing.j || newJoinMonth || '');
@@ -1399,11 +1480,20 @@ async function mergeMembersFromScan(scanTs, users) {
           }
         }
 
-        if (age < cutoff) delete members[username];
+        if (age < cutoff) {
+          delete members[username];
+          delete profiles[username];
+          delete history[username];
+        }
       }
 
       locations = compactLocationDictionary(members, locations);
-      chrome.storage.local.set({ pinalove_members: members, pinalove_member_locations: locations }, resolve);
+      chrome.storage.local.set({
+        pinalove_members: members,
+        pinalove_member_locations: locations,
+        pinalove_profiles: profiles,
+        pinalove_history: history,
+      }, resolve);
     });
   });
 }
@@ -1468,6 +1558,15 @@ async function mergeMembersFromProfile(username, profileData) {
 
       if (profileData.joinMonth && (!compact.j || profileData.joinMonth < compact.j)) {
         compact.j = profileData.joinMonth;
+        const olderTs = joinMonthToTs(profileData.joinMonth);
+        /* Only overwrite r if this photo-derived date is older than the stored one,
+           or if r is not yet set. Never downgrade a precise scan-time date to an
+           imprecise estimate unless the estimate is actually older (i.e. the user
+           must have registered before our scan date). */
+        if (olderTs && (!Number(compact.r) || olderTs < Number(compact.r))) {
+          compact.r = olderTs;
+          compact.ri = 1; // photo-path month is always an estimate (imprecise)
+        }
       }
 
       members[username] = compact;
@@ -1644,6 +1743,48 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       }
     })();
     return true; // keep the message channel open for the async response
+  }
+
+  /* ── Send private message ───────────────────────────────────────────── */
+  if (request.action === 'sendMessage') {
+    (async () => {
+      try {
+        const to = String(request.to || '').trim();
+        const msg = String(request.msg || '').trim();
+        const ufmcode = request.ufmcode == null ? '' : String(request.ufmcode);
+
+        if (!to) { sendResponse({ error: 'Missing recipient username' }); return; }
+        if (!msg) { sendResponse({ error: 'Cannot send empty message' }); return; }
+
+        const body = new URLSearchParams({
+          to,
+          msg,
+          type: 'message',
+          ufmcode,
+        }).toString();
+
+        const resp = await fetch(`${BASE}/nt/messenger.php`, {
+          method: 'POST',
+          credentials: 'include',
+          headers: {
+            'accept': '*/*',
+            'content-type': 'application/x-www-form-urlencoded; charset=UTF-8',
+            'x-requested-with': 'XMLHttpRequest',
+            'referer': `${BASE}/browse.php`,
+          },
+          body,
+        });
+
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        const raw = await resp.text();
+        const [result = '', additional = ''] = raw.split('||');
+        sendResponse({ ok: true, result: result.trim(), additional: (additional || '').trim(), raw });
+      } catch (err) {
+        console.error('[PinaLove] sendMessage error:', err.message);
+        sendResponse({ error: err.message });
+      }
+    })();
+    return true;
   }
 
   /* ── Clear all data ──────────────────────────────────────────────────── */

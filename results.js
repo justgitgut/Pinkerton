@@ -160,6 +160,8 @@ function decodeMemberEntry(username, raw, locations = []) {
       isNew: !!entry.isNew,
       isPremium: !!entry.isPremium,
       isVerified: !!entry.isVerified,
+      isBirthday: !!entry.isBirthday,
+      birthdayDate: entry.birthdayDate ?? entry.bd ?? null,
       joinMonth: entry.joinMonth ?? null,
       registeredAt: entry.registeredAt ?? entry.rt ?? 0,
       registeredAtImprecise: !!entry.ri,
@@ -180,6 +182,8 @@ function decodeMemberEntry(username, raw, locations = []) {
     isNew: !!(flags & 1),
     isPremium: !!(flags & 2),
     isVerified: !!(flags & 4),
+    isBirthday: !!(flags & 8),
+    birthdayDate: entry.bd ?? entry.birthdayDate ?? null,
     joinMonth: entry.j ?? null,
     registeredAt: entry.r ?? entry.rt ?? 0,
     registeredAtImprecise: !!entry.ri,
@@ -203,6 +207,13 @@ function nicknameColorStyle(user) {
 
 function isNewlyAddedOnRefresh(user) {
   return !!(user?.username && refreshNewUsers.has(user.username));
+}
+
+function birthdayIconHtml(user) {
+  if (!user?.isBirthday) return '';
+  const dt = user?.birthdayDate || '';
+  const label = dt ? `Birthday (${dt})` : 'Birthday today';
+  return ` <span title="${escAttr(label)}">🎂</span>`;
 }
 
 /* Lazy loading: current batch index for grid/table rendering */
@@ -1391,8 +1402,9 @@ function renderLazyTableBatch() {
     const thumb = u.photoUrl
       ? `<div class="table-thumb-wrap${newAtCreation ? ' newly-added' : ''}" style="cursor:pointer" title="Profile photo"><img src="${escAttr(thumbPhotoUrl(u.photoUrl))}" style="width:34px;height:38px;object-fit:cover;border-radius:4px;display:block" loading="lazy"></div>`
       : `<div style="width:34px;height:38px;border-radius:4px;background:var(--surf2);display:flex;align-items:center;justify-content:center;font-size:15px">👤</div>`;
-    const name   = `<a href="${escAttr(href)}" target="_blank" class="user-link" title="Open profile"${nicknameColorStyle(u)}>${esc(u.username||'?')}</a>`;
+    const name   = `<a href="${escAttr(href)}" target="_blank" class="user-link" title="Open profile"${nicknameColorStyle(u)}>${esc(u.username||'?')}</a>${birthdayIconHtml(u)}`;
     const extras = [
+      u.isBirthday ? '<span title="Birthday">🎂</span>' : '',
       u.isNew ? '<span title="New">✨</span>' : '',
       u.isPremium ? '<span title="Premium">👑</span>' : '',
       u.isVerified ? '<span title="Verified">✅</span>' : '',
@@ -1561,8 +1573,9 @@ function renderCard(u) {
       ${u.isNew      ? `<span class="card-tag new"      title="New">NEW</span>`    : ''}
     </div>
     <div class="card-body">
-      <div class="card-name"><a href="${escAttr(href)}" target="_blank" class="user-link" title="Open profile"${nicknameColorStyle(u)}>${nameTxt}</a></div>
+      <div class="card-name"><a href="${escAttr(href)}" target="_blank" class="user-link" title="Open profile"${nicknameColorStyle(u)}>${nameTxt}</a>${birthdayIconHtml(u)}</div>
       ${meta ? `<div class="card-meta">${meta}</div>` : ''}
+      ${u.isBirthday ? `<div class="card-meta" title="Birthday">🎂 Birthday</div>` : ''}
       ${joined ? `<div class="card-join" title="User joined date" style="color:${joined.color}">📅 ${esc(joined.text)}</div>` : ''}
       <div class="card-spark-row" title="Today activity (PH)">${spark}</div>
     </div>
@@ -1900,6 +1913,77 @@ function renderModalAvatarHtml(username, fallback = '') {
     : `<div class="pf-avatar-ph">&#x1F464;</div>`;
 }
 
+function sendMessageViaBg(to, msg, ufmcode = '') {
+  return new Promise((resolve, reject) => {
+    chrome.runtime.sendMessage({ action: 'sendMessage', to, msg, ufmcode }, res => {
+      if (chrome.runtime.lastError) return reject(new Error(chrome.runtime.lastError.message));
+      if (!res) return reject(new Error('No response'));
+      if (res.error) return reject(new Error(res.error));
+      resolve(res);
+    });
+  });
+}
+
+function wireMessageBox(modal) {
+  const input = modal.querySelector('#pfMsgInput');
+  const btn = modal.querySelector('#pfSendMsgBtn');
+  const status = modal.querySelector('#pfMsgStatus');
+  if (!input || !btn || !status || btn.dataset.wired) return;
+  btn.dataset.wired = '1';
+
+  const setStatus = (txt, color = 'var(--muted2)') => {
+    status.textContent = txt;
+    status.style.color = color;
+  };
+
+  btn.addEventListener('click', async () => {
+    const to = modal.dataset.activeUsername || '';
+    const message = input.value.trim();
+    if (!to) { setStatus('No recipient selected', 'var(--coral)'); return; }
+    if (!message) { setStatus('Cannot send empty message', 'var(--coral)'); input.focus(); return; }
+
+    btn.disabled = true;
+    btn.textContent = 'Sending...';
+    setStatus('');
+    try {
+      const res = await sendMessageViaBg(to, message, '');
+      switch (res.result) {
+        case 'sent':
+          input.value = '';
+          setStatus('Message sent', 'var(--teal)');
+          btn.textContent = 'Sent!';
+          setTimeout(() => { btn.textContent = 'Send'; }, 1400);
+          break;
+        case 'sentlimit':
+          setStatus(`Too many messages. Retry in ${res.additional || '?'}s`, 'var(--gold)');
+          btn.textContent = 'Send';
+          break;
+        case 'notsentlimit':
+          setStatus('Message not sent (limit). Try again later.', 'var(--gold)');
+          btn.textContent = 'Send';
+          break;
+        case 'notsent':
+          setStatus('Message not sent. Please try again.', 'var(--coral)');
+          btn.textContent = 'Send';
+          break;
+        case 'verifyprofile':
+          setStatus('Please verify your profile before sending messages.', 'var(--gold)');
+          btn.textContent = 'Send';
+          break;
+        default:
+          setStatus(res.result ? `Message status: ${res.result}` : 'Unexpected server response', 'var(--gold)');
+          btn.textContent = 'Send';
+          break;
+      }
+    } catch (err) {
+      setStatus(`Send failed: ${err.message}`, 'var(--coral)');
+      btn.textContent = 'Send';
+    } finally {
+      btn.disabled = false;
+    }
+  });
+}
+
 async function openProfileModal(username, profileUrl, u, userIndex, existingModal) {
   // Mark as visited with timestamp directly on user object
   const visitedTs = Date.now();
@@ -1924,17 +2008,21 @@ async function openProfileModal(username, profileUrl, u, userIndex, existingModa
     const prevUsername = modal.dataset.activeUsername || '';
     if (prevUsername && prevUsername !== username) releaseProfileCache(prevUsername);
     modal.dataset.activeUsername = username;
+    const msgInput = modal.querySelector('#pfMsgInput');
+    const msgStatus = modal.querySelector('#pfMsgStatus');
+    if (msgInput) msgInput.placeholder = `Send a private message to ${username} here.`;
+    if (msgStatus) msgStatus.textContent = '';
 
     // Update identity block
     modal.querySelector('.pf-avatar-wrap').innerHTML = renderModalAvatarHtml(username, u?.photoUrl || '');
     modal.querySelector('.pf-username').innerHTML =
-      `<a href="${escAttr(profileUrl)}" target="_blank" class="user-link"${nicknameColorStyle(u)}>${esc(username)}</a>`;
+      `<a href="${escAttr(profileUrl)}" target="_blank" class="user-link"${nicknameColorStyle(u)}>${esc(username)}</a>${birthdayIconHtml(u)}`;
     const visitedLabel = u?.visitedAt ? '🔍 ' + fmtVisited(u.visitedAt) : '';
     modal.querySelector('.pf-usermeta').textContent =
       [u?.age ? u.age+' yr' : '', u?.location, visitedLabel].filter(Boolean).join(' · ');
     // Badges now inline with username
     modal.querySelector('.pf-username').innerHTML =
-      `<a href="${escAttr(profileUrl)}" target="_blank" class="user-link"${nicknameColorStyle(u)}>${esc(username)}</a>${badges ? ' '+badges : ''}`;
+      `<a href="${escAttr(profileUrl)}" target="_blank" class="user-link"${nicknameColorStyle(u)}>${esc(username)}</a>${birthdayIconHtml(u)}${badges ? ' '+badges : ''}`;
 
     // Update nav button states
     modal.querySelector('.pf-prev-btn').disabled = userIndex <= 0;
@@ -2004,7 +2092,7 @@ async function openProfileModal(username, profileUrl, u, userIndex, existingModa
           </div>
           <div id="pfSizeComparison" class="pf-size-icons-row"></div>
           <div class="pf-identity-text">
-            <div class="pf-username"><a href="${escAttr(profileUrl)}" target="_blank" class="user-link"${nicknameColorStyle(u)}>${esc(username)}</a>${badges ? ' '+badges : ''}</div>
+            <div class="pf-username"><a href="${escAttr(profileUrl)}" target="_blank" class="user-link"${nicknameColorStyle(u)}>${esc(username)}</a>${birthdayIconHtml(u)}${badges ? ' '+badges : ''}</div>
             <div class="pf-usermeta">${[u?.age ? u.age+' yr' : '', u?.location].filter(Boolean).join(' \u00b7 ')}</div>
           </div>
         </div>
@@ -2024,6 +2112,11 @@ async function openProfileModal(username, profileUrl, u, userIndex, existingModa
           <div class="pf-ctrl-center-row">
             <button class="pf-ctrl-btn history-modal-btn">&#x1F4CA; Monthly Activity</button>
           </div>
+          <div id="pfMsgBox" style="display:flex;gap:6px;align-items:flex-start">
+            <textarea id="pfMsgInput" rows="2" placeholder="Send a private message..." style="flex:1;min-width:0;resize:vertical;max-height:110px;background:var(--surf2);border:1px solid var(--border);border-radius:6px;color:var(--text);font-family:var(--mono);font-size:11px;padding:6px 8px"></textarea>
+            <button class="pf-ctrl-btn" id="pfSendMsgBtn" style="padding:6px 10px">Send</button>
+          </div>
+          <div id="pfMsgStatus" style="min-height:14px;font-size:10px;color:var(--muted2)"></div>
           <div class="pf-spark-label">24h activity</div>
           <div id="pfSparkContainer"></div>
         </div>
@@ -2052,6 +2145,9 @@ async function openProfileModal(username, profileUrl, u, userIndex, existingModa
   modal.querySelector('.pf-next-btn').addEventListener('click', () => {
     if (userIndex < filteredUsers.length-1) { const n = filteredUsers[userIndex+1]; openProfileModal(n.username, n.profileUrl||'#', n, userIndex+1, modal); }
   });
+  wireMessageBox(modal);
+  const msgInput = modal.querySelector('#pfMsgInput');
+  if (msgInput) msgInput.placeholder = `Send a private message to ${username} here.`;
 
   document.body.appendChild(modal);
 
@@ -2353,6 +2449,13 @@ function renderProfileBody(username, parsed, container) {
   const ageRange = (fields['Min. age'] && fields['Max. age'])
     ? `${fields['Min. age']}–${fields['Max. age']}`
     : (fields['Min. age'] || fields['Max. age'] || '');
+  const liveUser = allUsers.find(u => u.username === username);
+  const birthdayDisplay = liveUser?.birthdayDate
+    ? new Date(liveUser.birthdayDate + 'T00:00:00+08:00').toLocaleDateString('en-PH', {
+        timeZone: 'Asia/Manila',
+        month: 'short', day: '2-digit', year: 'numeric'
+      })
+    : '';
 
   // Join date from earliest photo URL month — prefix with ≤ since photos may predate account
   const joinDisplay = entry.joinMonth
@@ -2368,6 +2471,7 @@ function renderProfileBody(username, parsed, container) {
     frow1('Education',    fields['Education'] || ''),
     frow1('City',         fields['City'] || ''),
     frow1('Country',      fields['Country'] || ''),
+    frow1('Birthday',     birthdayDisplay),
     frow1('Joined',       joinDisplay),
     frow1('Looking for',  fields['Looking for'] || ''),
     frow1('Relationship', fields['Relationship'] || ''),
@@ -2667,7 +2771,7 @@ function openHistoryModal(username) {
         <div class="modal-user">
           ${u.photoUrl?`<img src="${escAttr(thumbPhotoUrl(u.photoUrl))}" class="modal-photo">`:'<div class="modal-photo-ph">&#x1F464;</div>'}
           <div>
-            <div class="modal-name"><a href="${escAttr(u.profileUrl||'#')}" target="_blank" class="user-link"${nicknameColorStyle(u)}>${esc(username)}</a></div>
+            <div class="modal-name"><a href="${escAttr(u.profileUrl||'#')}" target="_blank" class="user-link"${nicknameColorStyle(u)}>${esc(username)}</a>${birthdayIconHtml(u)}</div>
             <div class="modal-meta">${[u.age,u.location].filter(Boolean).join(' · ')} · ${fmtMinutes(total)} in 30d</div>
           </div>
         </div>
