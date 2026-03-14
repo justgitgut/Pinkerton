@@ -1,5 +1,5 @@
 /**
- * popup.js — Pinkerton v3.0
+ * popup.js — Pinkerton
  *
  * Controls the extension popup UI (popup.html).
  * The popup is a short-lived page — it is destroyed and recreated each time
@@ -17,6 +17,17 @@
 /* ─── Shorthand ──────────────────────────────────────────────────────────────── */
 
 const $ = id => document.getElementById(id);
+
+function renderExtensionVersion() {
+  const version = chrome.runtime.getManifest?.().version;
+  if (!version) return;
+
+  const logoVersion = $('logoVersion');
+  if (logoVersion) logoVersion.textContent = `v${version}`;
+
+  const infoVersion = $('infoVersion');
+  if (infoVersion) infoVersion.textContent = `Pinkerton v${version} · Chrome Extension`;
+}
 
 /* ─── State ──────────────────────────────────────────────────────────────────── */
 
@@ -98,6 +109,8 @@ const WATCHDOG_MS    = 30000; /* 30 seconds without a progress update = frozen *
 
 /* IIFE so we can use await at top level without polluting the global scope. */
 (async () => {
+  renderExtensionVersion();
+
 
   /* Ensure at least one PinaLove tab is open, because the background script
      needs an active session (cookies) to make authenticated requests.

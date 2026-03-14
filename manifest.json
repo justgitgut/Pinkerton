@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Pinkerton",
-  "version": "3.5.0",
+  "version": "3.5.2",
   "description": "Track PinaLove.com online user activity. Scans automatically, stores history locally, and displays trends in a private dashboard.",
   "permissions": [
     "scripting",

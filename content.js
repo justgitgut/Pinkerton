@@ -1,4 +1,4 @@
-// content.js — PinaLove Counter v2.6
+// content.js — PinaLove Counter
 // Re-register listener on every injection (safe — Chrome deduplicates per page load)
 // Remove any previous listener to avoid doubles on re-injection
 if (window.__pinaloveListener) {
