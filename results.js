@@ -1,5 +1,5 @@
 /* 
-  results.js — Pinkerton v3.1
+  results.js — Pinkerton
   
   Dashboard page for browsing, filtering, and analyzing PinaLove members and their online activity.
   Displays grid/table views of profiles, member history, per-user analytics, and photo galleries.
@@ -9,10 +9,18 @@
 /* Utility: shorthand for document.getElementById() */
 const $ = id => document.getElementById(id);
 
+function renderExtensionVersion() {
+  const version = chrome.runtime.getManifest?.().version;
+  if (!version) return;
+  const el = $('resultsLogoVersion');
+  if (el) el.textContent = `v${version}`;
+}
+
 /* Philippine timezone offset: UTC+8 hours (used throughout for all time calculations) */
 const PH_OFFSET_MS = 8 * 3600 * 1000;
 const HISTORY_PACK_PREFIX = 'p1:';
 const MEMBER_BASE_URL = 'https://www.pinalove.com';
+const MESSAGE_SENDING_ENABLED = false;
 
 /* 
   =====================================================
@@ -271,7 +279,11 @@ function phHourNow() { return tsToPhHour(Date.now()); }
 */
 
 /* Initial page load: bind events and load all data from storage */
-document.addEventListener('DOMContentLoaded', () => { bindEvents(); loadData(); });
+document.addEventListener('DOMContentLoaded', () => {
+  renderExtensionVersion();
+  bindEvents();
+  loadData();
+});
 
 /* 
   =====================================================
@@ -1915,6 +1927,10 @@ function renderModalAvatarHtml(username, fallback = '') {
 
 function sendMessageViaBg(to, msg, ufmcode = '') {
   return new Promise((resolve, reject) => {
+    if (!MESSAGE_SENDING_ENABLED) {
+      reject(new Error('Private messaging is temporarily disabled'));
+      return;
+    }
     chrome.runtime.sendMessage({ action: 'sendMessage', to, msg, ufmcode }, res => {
       if (chrome.runtime.lastError) return reject(new Error(chrome.runtime.lastError.message));
       if (!res) return reject(new Error('No response'));
@@ -2112,11 +2128,12 @@ async function openProfileModal(username, profileUrl, u, userIndex, existingModa
           <div class="pf-ctrl-center-row">
             <button class="pf-ctrl-btn history-modal-btn">&#x1F4CA; Monthly Activity</button>
           </div>
+          ${MESSAGE_SENDING_ENABLED ? `
           <div id="pfMsgBox" style="display:flex;gap:6px;align-items:flex-start">
             <textarea id="pfMsgInput" rows="2" placeholder="Send a private message..." style="flex:1;min-width:0;resize:vertical;max-height:110px;background:var(--surf2);border:1px solid var(--border);border-radius:6px;color:var(--text);font-family:var(--mono);font-size:11px;padding:6px 8px"></textarea>
             <button class="pf-ctrl-btn" id="pfSendMsgBtn" style="padding:6px 10px">Send</button>
           </div>
-          <div id="pfMsgStatus" style="min-height:14px;font-size:10px;color:var(--muted2)"></div>
+          <div id="pfMsgStatus" style="min-height:14px;font-size:10px;color:var(--muted2)"></div>` : ''}
           <div class="pf-spark-label">24h activity</div>
           <div id="pfSparkContainer"></div>
         </div>
@@ -2147,7 +2164,7 @@ async function openProfileModal(username, profileUrl, u, userIndex, existingModa
   });
   wireMessageBox(modal);
   const msgInput = modal.querySelector('#pfMsgInput');
-  if (msgInput) msgInput.placeholder = `Send a private message to ${username} here.`;
+  if (msgInput && MESSAGE_SENDING_ENABLED) msgInput.placeholder = `Send a private message to ${username} here.`;
 
   document.body.appendChild(modal);
 

@@ -1,5 +1,5 @@
 /**
- * background.js — Pinkerton v3.5
+ * background.js — Pinkerton
  *
  * Service worker for the Pinkerton Chrome extension.
  * Runs persistently in the background (woken by alarms or messages).
@@ -51,6 +51,7 @@ const NEW_FLAG_MAX_DAYS = 7;
 
 /* Base URL for all PinaLove requests. */
 const BASE = 'https://www.pinalove.com';
+const MESSAGE_SENDING_ENABLED = false;
 
 /* How long to wait for a single page fetch before aborting.
  * PinaLove occasionally stalls indefinitely — without this the scan loop
@@ -1749,6 +1750,11 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   if (request.action === 'sendMessage') {
     (async () => {
       try {
+        if (!MESSAGE_SENDING_ENABLED) {
+          sendResponse({ error: 'Private messaging is temporarily disabled' });
+          return;
+        }
+
         const to = String(request.to || '').trim();
         const msg = String(request.msg || '').trim();
         const ufmcode = request.ufmcode == null ? '' : String(request.ufmcode);
